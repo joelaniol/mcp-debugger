@@ -19,6 +19,15 @@ MCP Debugger (aka MCP Diagnoser PRO) is a desktop toolkit for exercising MCP ser
 - Visual workflows for running individual MCP tool calls, audits, and exporting logs.
 - Certificate helper (`certgen_ca_server.py`) to create localhost-ready CA and server certificates for TLS testing.
 
+### Diagnostics Coverage Schema
+| Area | What Gets Exercised | Notes |
+| --- | --- | --- |
+| Streaming (SSE) | Negotiates event streams, enforces `sse_max_seconds`, captures raw payloads for review. | Validates graceful handling when a server keeps streaming or falls back to JSON. |
+| Authentication (OAuth2 / Bearer) | Sends requests with configured access tokens or client credentials. | Ensure tokens are scoped to lab systems; tool does not obtain tokens for you. |
+| Destructive Commands (Delete / Reset) | Invokes high-impact tool methods, including delete or purge operations. | Always isolate target systems; responses are logged for later auditing. |
+| Error & Validation Paths | Calls `rpc/does_not_exist`, malformed `tools/call`, and schema edge cases. | Confirms servers return JSON-RPC errors instead of hanging. |
+| Performance & Timeouts | Measures per-call latency, payload sizes, and concurrency behaviour. | Tune `--timeout`, `--per-timeout`, and parallelism to match lab capacity. |
+
 ### Windows Installation
 1. Ensure Python 3.10 or newer is available via `py -3` or `python` in your PATH.
 2. Run `setup_and_run.bat` either via double-click or from PowerShell (`.\setup_and_run.bat`).
@@ -65,6 +74,15 @@ Der MCP Debugger (MCP Diagnoser PRO) ist ein Desktop-Werkzeug, um MCP-Server End
 - Windows-Installer-Skript (`setup_and_run.bat`), das eine virtuelle Umgebung aufbaut, Abhaengigkeiten installiert und die GUI startet.
 - Visuelle Oberflaeche zum Ausfuehren einzelner Tool-Calls, Audit-Laeufe und zum Exportieren von Logs.
 - Zertifikats-Helfer (`certgen_ca_server.py`) fuer eine lokale Root-CA und Server-Zertifikate fuer TLS-Tests auf localhost.
+
+### Test-Schema
+| Bereich | Was geprueft wird | Hinweise |
+| --- | --- | --- |
+| Streaming (SSE) | Verhandelt Event-Streams, erzwingt `sse_max_seconds`, protokolliert Rohdaten. | Prueft Verhalten bei endlosen oder JSON-Fallback-Antworten. |
+| Authentifizierung (OAuth2 / Bearer) | Sendet Requests mit hinterlegten Tokens oder Client-Credentials. | Tokens muessen fuer die Laborumgebung vorgesehen sein; Beschaffung erfolgt extern. |
+| Destruktive Kommandos (Delete / Reset) | Fuehrt Werkzeuge mit Loesch- oder Bereinigungswirkung aus. | Nur auf isolierten Zielsystemen einsetzen; Antworten werden fuer Audits gespeichert. |
+| Fehler- und Validierungspfade | Ruft `rpc/does_not_exist`, fehlerhafte `tools/call` und Schema-Grenzfaelle auf. | Sicherstellt, dass Server JSON-RPC-Fehler liefern statt zu haengen. |
+| Performance & Timeouts | Misst Latenz, Payload-Groessen und Parallelisierung. | Passe `--timeout`, `--per-timeout` und Parallel-Parameter an die Labor-Kapazitaet an. |
 
 ### Installation unter Windows
 1. Stelle sicher, dass Python 3.10 oder neuer ueber `py -3` oder `python` im PATH erreichbar ist.
