@@ -1,3 +1,6 @@
+!!! WARNING WARNING WARNING !!!
+Read carefully before using.
+
 # MCP Debugger - Windows Installer
 
 > EN: This repository only contains the Windows setup base. Anything generated during installation (virtual environments, certificates, caches, etc.) must stay out of Git and is covered by `.gitignore`.
