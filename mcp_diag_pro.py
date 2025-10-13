@@ -496,7 +496,7 @@ class ProGUI:
 
         self._wizard_active=False
         self._build()
-        self._center_window(self.root)
+        self._center_window(self.root, min_w=900, min_h=640)
         self._pump()
         if self.root is not None:
             self.root.after(200, self._show_wizard)
@@ -648,13 +648,13 @@ class ProGUI:
         tip = ttk.Label(self.root, text="Hinweis: Overall timeout gilt nur für den Gesamtcheck. Bearer nur via TLS.", foreground="#444")
         tip.pack(fill="x", **p)
 
-    def _center_window(self, window):
+    def _center_window(self, window, min_w=600, min_h=480):
         try:
             window.update_idletasks()
             w = window.winfo_width()
             h = window.winfo_height()
-            if w <= 0: w = 800
-            if h <= 0: h = 600
+            if w < min_w: w = min_w
+            if h < min_h: h = min_h
             sw = window.winfo_screenwidth()
             sh = window.winfo_screenheight()
             x = max((sw - w) // 2, 0)
@@ -1084,8 +1084,16 @@ class SetupWizard(tk.Toplevel):
         self.bind("<Escape>", lambda *_: self._finish())
 
         self._render_step()
-        self.after(0, self._center_on_parent)
+        self._center_on_parent()
         self.grab_set()
+        try:
+            self.transient(gui.root)
+        except Exception:
+            pass
+        try:
+            self.lift()
+        except Exception:
+            pass
         try:
             self.focus_force()
         except Exception:
@@ -1246,17 +1254,19 @@ class SetupWizard(tk.Toplevel):
         return True
 
     def _center_on_parent(self):
+        parent = self.gui.root if hasattr(self.gui, "root") else None
+        if not parent:
+            return
         try:
-            parent = self.gui.root
-            if parent is None:
-                return
             parent.update_idletasks()
             self.update_idletasks()
             pw, ph = parent.winfo_width(), parent.winfo_height()
+            if pw <= 0: pw = 900
+            if ph <= 0: ph = 640
             px, py = parent.winfo_rootx(), parent.winfo_rooty()
             w, h = self.winfo_width(), self.winfo_height()
-            if w <= 0: w = 480
-            if h <= 0: h = 320
+            if w < 480: w = 480
+            if h < 320: h = 320
             x = px + max((pw - w)//2, 0)
             y = py + max((ph - h)//2, 0)
             self.geometry(f"{w}x{h}+{x}+{y}")
