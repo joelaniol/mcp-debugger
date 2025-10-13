@@ -1099,6 +1099,9 @@ class SetupWizard(tk.Toplevel):
         except Exception:
             pass
 
+    def _default_ca_display(self):
+        return os.path.join(".", "certs", "ca.cert.pem")
+
     # ----- step renderers -----
     def _render_step(self):
         for child in self.body.winfo_children():
