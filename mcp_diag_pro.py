@@ -1,4 +1,4 @@
-import argparse, json, time, threading, queue, sys, os, logging, zipfile, concurrent.futures, shlex, warnings
+import argparse, json, time, threading, queue, sys, os, logging, zipfile, concurrent.futures, shlex, warnings, math
 from contextlib import contextmanager
 import requests
 from sseclient import SSEClient
@@ -287,6 +287,73 @@ class MCP:
                     continue
         return None
 
+    def _estimate_tokens(self, rpc_obj):
+        candidates=("total_tokens","totalTokens","token_count","tokenCount","output_tokens","outputTokens","tokens")
+
+        def _metric_from_dict(data):
+            if not isinstance(data, dict):
+                return None
+            usage=data.get("usage")
+            if isinstance(usage, dict):
+                for key in candidates:
+                    val=usage.get(key)
+                    if isinstance(val, (int, float)):
+                        return int(val)
+            for key in candidates:
+                val=data.get(key)
+                if isinstance(val, (int, float)):
+                    return int(val)
+            return None
+
+        if isinstance(rpc_obj, dict):
+            metric=_metric_from_dict(rpc_obj)
+            if metric is not None:
+                return metric
+            result=rpc_obj.get("result")
+            metric=_metric_from_dict(result)
+            if metric is not None:
+                return metric
+
+        texts=[]
+        seen=set()
+
+        def collect(val):
+            key=id(val)
+            if key in seen:
+                return
+            seen.add(key)
+            if isinstance(val, str):
+                if val.strip():
+                    texts.append(val)
+                return
+            if isinstance(val, dict):
+                # Focus on likely textual fields
+                for k in ("text","data","message","value","body","content","structuredContent","output","result"):
+                    if k in val:
+                        collect(val[k])
+                for v in val.values():
+                    if isinstance(v, (dict, list, tuple, set)):
+                        collect(v)
+            elif isinstance(val, (list, tuple, set)):
+                for item in val:
+                    collect(item)
+
+        if isinstance(rpc_obj, dict):
+            collect(rpc_obj.get("result"))
+        collect(rpc_obj)
+
+        total_chars=sum(len(t) for t in texts if isinstance(t, str))
+        if total_chars>0:
+            return max(1, int(math.ceil(total_chars/4.0)))
+        try:
+            dumped=json.dumps(rpc_obj, ensure_ascii=False)
+            total_chars=len(dumped)
+            if total_chars>0:
+                return max(1, int(math.ceil(total_chars/4.0)))
+        except Exception:
+            pass
+        return 0
+
     def audit_tools(self, limit=None, per_call_timeout=None, parallelism=1, stop_flag=None, on_progress=None, validate_outputs=True):
         tools_obj, _ = self.list_tools()
         tools = (tools_obj.get("result") or {}).get("tools") or []
@@ -306,14 +373,16 @@ class MCP:
             detail = "" if ok else err or "Validation failed"
             ms = 0
             kb = 0.0
+            tokens = 0
             if not ok:
-                res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"args":args,"http":None}
+                res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":None}
                 if on_progress: on_progress(res)
                 return res
             try:
                 start=time.monotonic()
                 obj, resp = self.call("tools/call", {"name": name, "arguments": args}, sse_max_seconds=20)
                 ms = int(round((time.monotonic()-start)*1000))
+                tokens = self._estimate_tokens(obj)
                 try:
                     ct=(resp.headers.get("Content-Type") or "").lower()
                 except Exception:
@@ -346,15 +415,15 @@ class MCP:
                                     else: out_status="OUTPUT_SCHEMA_INVALID"; out_detail=v_err or "schema validation failed"
                     if out_status:
                         detail = (detail + ("; " if detail else "") + f"{out_status}: {out_detail}").strip("; ")
-                else:
-                    status="HTTP_ERROR"; detail=f"HTTP {resp.status_code}"
-                res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"args":args,"http":resp.status_code}
+                    else:
+                        status="HTTP_ERROR"; detail=f"HTTP {resp.status_code}"
+                res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":resp.status_code}
             except requests.exceptions.Timeout as e:
                 ms = int(round((time.monotonic()-start)*1000))
-                res={"tool":name,"status":"TIMEOUT","detail":str(e),"ms":ms,"kb":0.0,"args":args,"http":None}
+                res={"tool":name,"status":"TIMEOUT","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None}
             except Exception as e:
                 ms = int(round((time.monotonic()-start)*1000))
-                res={"tool":name,"status":"EXCEPTION","detail":str(e),"ms":ms,"kb":0.0,"args":args,"http":None}
+                res={"tool":name,"status":"EXCEPTION","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None}
             if on_progress: on_progress(res)
             return res
 
@@ -604,17 +673,19 @@ class ProGUI:
         ttk.Button(sumbtns, text="Clear summary", command=lambda: self.summary.delete(*self.summary.get_children())).pack(side="left")
 
         ttk.Label(left, text="Audit results (per tool)").pack(anchor="w")
-        self.audit=ttk.Treeview(left, columns=("tool","status","ms","kb","detail"), show="headings", height=12)
+        self.audit=ttk.Treeview(left, columns=("tool","status","ms","tokens","kb","detail"), show="headings", height=12)
         self.audit.heading("tool", text="Tool")
         self.audit.heading("status", text="Status")
         self.audit.heading("ms", text="ms")
+        self.audit.heading("tokens", text="Tokens")
         self.audit.heading("kb", text="KB")
         self.audit.heading("detail", text="Detail")
         self.audit.column("tool", width=220, anchor="w")
         self.audit.column("status", width=130, anchor="center")
         self.audit.column("ms", width=70, anchor="center")
+        self.audit.column("tokens", width=90, anchor="center")
         self.audit.column("kb", width=90, anchor="center")
-        self.audit.column("detail", width=280, anchor="w")
+        self.audit.column("detail", width=260, anchor="w")
         self.audit.tag_configure("ok", foreground="#0A7D00")
         self.audit.tag_configure("err", foreground="#B00020")
         self.audit.pack(fill="both", expand=True)
@@ -895,7 +966,10 @@ class ProGUI:
                 errset={"ARGS_INVALID","HTTP_ERROR","PROTOCOL_ERROR","TOOL_ERROR","TIMEOUT","EXCEPTION","OUTPUT_SCHEMA_INVALID"}
                 if res["status"] in okset: tag="ok"
                 elif res["status"] in errset: tag="err"
-                self.audit.insert("", "end", values=(res["tool"], res["status"], f"{int(res.get('ms',0))}", f"{res.get('kb',0.0):.2f}", res.get("detail","")), tags=((tag,) if tag else ()))
+                tokens_val=res.get("tokens",0)
+                try: tokens_str=str(int(tokens_val))
+                except Exception: tokens_str=str(tokens_val)
+                self.audit.insert("", "end", values=(res["tool"], res["status"], f"{int(res.get('ms',0))}", tokens_str, f"{res.get('kb',0.0):.2f}", res.get("detail","")), tags=((tag,) if tag else ()))
                 cur=self.audit_progress.get() or "0 done"
                 try: cnt=int(cur.split()[0])+1
                 except: cnt=1

@@ -18,6 +18,7 @@ MCP Debugger (aka MCP Diagnoser PRO) is a desktop toolkit for exercising HTTP/SS
 - One-click Windows installer script (`setup_and_run.bat`) that provisions a virtual environment, installs dependencies, and starts the GUI.
 - Visual workflows for running individual MCP tool calls, audits, and exporting logs.
 - First-class HTTP + Server-Sent Events diagnostics (stream capture, timeout enforcement, SSE fallback handling).
+- Audit metrics track latency, payload size, and token estimates per tool call.
 - Certificate helper (`certgen_ca_server.py`) to create localhost-ready CA and server certificates for TLS testing.
 
 ### Diagnostics Coverage Schema
@@ -28,7 +29,7 @@ MCP Debugger (aka MCP Diagnoser PRO) is a desktop toolkit for exercising HTTP/SS
 | Authentication (OAuth2 / Bearer) | Sends requests with configured access tokens or client credentials. | Ensure tokens are scoped to lab systems; tool does not obtain tokens for you. |
 | Destructive Commands (Delete / Reset) | Invokes high-impact tool methods, including delete or purge operations. | Always isolate target systems; responses are logged for later auditing. |
 | Error & Validation Paths | Calls `rpc/does_not_exist`, malformed `tools/call`, and schema edge cases. | Confirms servers return JSON-RPC errors instead of hanging. |
-| Performance & Timeouts | Measures per-call latency, payload sizes, and concurrency behaviour. | Tune `--timeout`, `--per-timeout`, and parallelism to match lab capacity. |
+| Performance & Timeouts | Measures per-call latency, payload sizes, token estimates, and concurrency behaviour. | Tune `--timeout`, `--per-timeout`, and parallelism to match lab capacity. |
 
 ### Windows Installation
 1. Ensure Python 3.10 or newer is available via `py -3` or `python` in your PATH.
@@ -71,6 +72,14 @@ The **Run all audit** action executes every available tool and scenario against 
 
 Refer to `mcp_diag_pro.py --help` for the complete parameter list.
 
+### Audit Metrics Reference
+| Column | Description | Why it matters |
+| --- | --- | --- |
+| `ms` | Wall-clock latency of the tool call. | Highlights slow handlers, retries, or network delays. |
+| `Tokens` | Estimated combined tokens (result metadata or character-based fallback). | Reveals output size growth and possible quota pressure. |
+| `KB` | Size of the JSON payload captured from the response. | Helps spot unusually large responses or streaming issues. |
+| `Detail` | Status notes (`OUTPUT_VALID`, HTTP codes, schema errors, etc.). | Pinpoints failing steps in the call pipeline. |
+
 ---
 
 ## Deutsch
@@ -82,6 +91,7 @@ Der MCP Debugger (MCP Diagnoser PRO) ist ein Desktop-Werkzeug, um HTTP/SSE-basie
 - Windows-Installer-Skript (`setup_and_run.bat`), das eine virtuelle Umgebung aufbaut, Abhaengigkeiten installiert und die GUI startet.
 - Visuelle Oberflaeche zum Ausfuehren einzelner Tool-Calls, Audit-Laeufe und zum Exportieren von Logs.
 - Vollstaendige HTTP- und SSE-Diagnostik (Stream-Capture, Timeouts, Fallbacks).
+- Audit-Metriken erfassen Latenz, Payload-Groesse und Token-Schaetzungen pro Tool-Call.
 - Zertifikats-Helfer (`certgen_ca_server.py`) fuer eine lokale Root-CA und Server-Zertifikate fuer TLS-Tests auf localhost.
 
 ### Test-Schema
@@ -92,7 +102,7 @@ Der MCP Debugger (MCP Diagnoser PRO) ist ein Desktop-Werkzeug, um HTTP/SSE-basie
 | Authentifizierung (OAuth2 / Bearer) | Sendet Requests mit hinterlegten Tokens oder Client-Credentials. | Tokens muessen fuer die Laborumgebung vorgesehen sein; Beschaffung erfolgt extern. |
 | Destruktive Kommandos (Delete / Reset) | Fuehrt Werkzeuge mit Loesch- oder Bereinigungswirkung aus. | Nur auf isolierten Zielsystemen einsetzen; Antworten werden fuer Audits gespeichert. |
 | Fehler- und Validierungspfade | Ruft `rpc/does_not_exist`, fehlerhafte `tools/call` und Schema-Grenzfaelle auf. | Sicherstellt, dass Server JSON-RPC-Fehler liefern statt zu haengen. |
-| Performance & Timeouts | Misst Latenz, Payload-Groessen und Parallelisierung. | Passe `--timeout`, `--per-timeout` und Parallel-Parameter an die Labor-Kapazitaet an. |
+| Performance & Timeouts | Misst Latenz, Payload-Groessen, Token-Schaetzungen und Parallelisierung. | Passe `--timeout`, `--per-timeout` und Parallel-Parameter an die Labor-Kapazitaet an. |
 
 ### Installation unter Windows
 1. Stelle sicher, dass Python 3.10 oder neuer ueber `py -3` oder `python` im PATH erreichbar ist.
@@ -134,3 +144,11 @@ Der Button **Run all audit** fuehrt saemtliche verfuegbaren Tools und Szenarien 
 ```
 
 Weitere Optionen listet `mcp_diag_pro.py --help` auf.
+
+### Audit-Metriken im Ueberblick
+| Spalte | Bedeutung | Nutzen |
+| --- | --- | --- |
+| `ms` | Gemessene Laufzeit je Tool-Aufruf. | Zeigt langsame Handler, Timeouts oder Netzlatenzen. |
+| `Tokens` | Geschaetzte Token-Anzahl (aus Usage-Daten oder Zeichenanzahl). | Macht wachsende Outputs und moegliche Kontingentprobleme sichtbar. |
+| `KB` | Groesse der Antwort-Payload (JSON) in Kilobyte. | Entdeckt unueblich grosse Antworten oder Streaming-Anomalien. |
+| `Detail` | Statushinweise (`OUTPUT_VALID`, HTTP-Codes, Schemafehler, ...). | Lokalisiert Fehlerpunkte innerhalb der Call-Pipeline. |
