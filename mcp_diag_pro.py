@@ -175,12 +175,28 @@ class MCP:
 
         # If server unexpectedly returns SSE but we explicitly asked JSON-only or stream=False, don't block
         if "text/event-stream" in ct and (accept_json_only or not stream):
-            self.sink.write("<< WARN: Unexpected text/event-stream for non-stream call; capturing raw body.")
+            self.sink.write("<< WARN: Unexpected text/event-stream for non-stream call; parsing first event.")
             try:
-                raw = r.text
-            except Exception:
-                raw = "<streaming>"
-            obj={"_raw": raw, "_note":"unexpected event-stream for non-stream/json-only call"}
+                client = SSEClient(r)
+                event_obj = None
+                for ev in client.events():
+                    try:
+                        data = json.loads(ev.data)
+                        event_obj = data
+                        break
+                    except Exception:
+                        self.sink.write(f"<< [SSE raw] {ev.data}")
+                if event_obj is None:
+                    obj={"_raw": r.text, "_note":"event-stream without parsable JSON"}
+                else:
+                    obj=event_obj
+            except Exception as exc:
+                self.sink.write(f"<< WARN: Failed to parse SSE fallback: {exc}")
+                try:
+                    raw = r.text
+                except Exception:
+                    raw = "<streaming>"
+                obj={"_raw": raw, "_note":"unexpected event-stream for non-stream/json-only call"}
             self.last_body=obj
             return obj, r
 
@@ -1054,6 +1070,7 @@ class ProGUI:
         def run():
             try:
                 summary, details = c.overall(timeout_override=ov_to)
+                self._sink(f"Overall summary entries: {len(summary)}")
             except Exception as e:
                 summary=[{"level":"MUST","check":"overall()", "status":"FAIL","detail":str(e)}]; details={}
             self.last_report={"summary":summary,"details":details,"log":"\n".join(self.mem_log),"meta":{"url":self.url.get().strip(),"tls_mode":self.tls_mode.get(),"time":time.strftime("%Y-%m-%d %H:%M:%S"),"protocol_version":getattr(c,'proto',''),"session_id":getattr(c,'sid','')}}
@@ -1423,8 +1440,11 @@ class SetupWizard(tk.Toplevel):
     def _render_step(self):
         for child in self.body.winfo_children():
             child.destroy()
+        for attr in ("_cert_entry", "_cert_browse", "_tls_entry", "_tls_browse", "_tls_combo"):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
         title, builder = self.steps[self.step_index]
-        self.header.config(text=f"Step {self.step_index+1} of {len(self.steps)} · {title}")
+        self.header.config(text=f"Step {self.step_index+1} of {len(self.steps)} - {title}")
         builder(self.body)
         self.back_btn.config(state="normal" if self.step_index > 0 else "disabled")
         self.next_btn.config(text="Finish" if self.step_index == len(self.steps)-1 else "Next")
@@ -1521,23 +1541,28 @@ class SetupWizard(tk.Toplevel):
     def _update_cert_controls(self, *_):
         mode = self.cert_choice.get()
         state = "normal" if mode == "existing" else "disabled"
-        if hasattr(self, "_cert_entry"):
-            self._cert_entry.config(state=state)
-        if hasattr(self, "_cert_browse"):
-            self._cert_browse.config(state=state)
+        entry = getattr(self, "_cert_entry", None)
+        if entry is not None and str(entry) and entry.winfo_exists():
+            entry.config(state=state)
+        browse = getattr(self, "_cert_browse", None)
+        if browse is not None and str(browse) and browse.winfo_exists():
+            browse.config(state=state)
 
     def _update_tls_controls(self, *_):
         mode = self.tls_choice.get()
         use_custom = mode == "Pick file..."
         entry_state = "normal" if use_custom else "disabled"
-        if hasattr(self, "_tls_entry"):
-            self._tls_entry.config(state=entry_state)
-        if hasattr(self, "_tls_browse"):
-            self._tls_browse.config(state="normal" if use_custom else "disabled")
-        if hasattr(self, "_tls_combo"):
+        tls_entry = getattr(self, "_tls_entry", None)
+        if tls_entry is not None and str(tls_entry) and tls_entry.winfo_exists():
+            tls_entry.config(state=entry_state)
+        tls_browse = getattr(self, "_tls_browse", None)
+        if tls_browse is not None and str(tls_browse) and tls_browse.winfo_exists():
+            tls_browse.config(state="normal" if use_custom else "disabled")
+        combo = getattr(self, "_tls_combo", None)
+        if combo is not None and str(combo) and combo.winfo_exists():
             target = next((label for label,value in self._tls_options if value==self.tls_choice.get()), None)
             if target:
-                self._tls_combo.set(target)
+                combo.set(target)
         if mode == "Embedded CA (./certs/ca.cert.pem)":
             self.custom_ca.set(self._default_ca_display())
         elif mode != "Pick file...":
