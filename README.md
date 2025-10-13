@@ -12,17 +12,19 @@ Read carefully before using.
 ## English
 
 ### What Is MCP Debugger?
-MCP Debugger (aka MCP Diagnoser PRO) is a desktop toolkit for exercising MCP servers end-to-end. It spins up a local Python runtime, launches the GUI, and lets you run targeted or bulk diagnostics against your server implementations.
+MCP Debugger (aka MCP Diagnoser PRO) is a desktop toolkit for exercising HTTP/SSE-based MCP servers end-to-end. It spins up a local Python runtime, launches the GUI, and lets you run targeted or bulk diagnostics against your server implementations, including streaming event sources.
 
 ### Key Features
 - One-click Windows installer script (`setup_and_run.bat`) that provisions a virtual environment, installs dependencies, and starts the GUI.
 - Visual workflows for running individual MCP tool calls, audits, and exporting logs.
+- First-class HTTP + Server-Sent Events diagnostics (stream capture, timeout enforcement, SSE fallback handling).
 - Certificate helper (`certgen_ca_server.py`) to create localhost-ready CA and server certificates for TLS testing.
 
 ### Diagnostics Coverage Schema
 | Area | What Gets Exercised | Notes |
 | --- | --- | --- |
 | Streaming (SSE) | Negotiates event streams, enforces `sse_max_seconds`, captures raw payloads for review. | Validates graceful handling when a server keeps streaming or falls back to JSON. |
+| HTTP Transport | Exercises initialize/tool/resource endpoints over HTTPS with detailed logging and cURL export. | Highlights latency, headers, TLS trust mode, and retry behaviour. |
 | Authentication (OAuth2 / Bearer) | Sends requests with configured access tokens or client credentials. | Ensure tokens are scoped to lab systems; tool does not obtain tokens for you. |
 | Destructive Commands (Delete / Reset) | Invokes high-impact tool methods, including delete or purge operations. | Always isolate target systems; responses are logged for later auditing. |
 | Error & Validation Paths | Calls `rpc/does_not_exist`, malformed `tools/call`, and schema edge cases. | Confirms servers return JSON-RPC errors instead of hanging. |
@@ -74,17 +76,19 @@ Refer to `mcp_diag_pro.py --help` for the complete parameter list.
 ## Deutsch
 
 ### Was ist der MCP Debugger?
-Der MCP Debugger (MCP Diagnoser PRO) ist ein Desktop-Werkzeug, um MCP-Server End-to-End zu testen. Er richtet lokal eine Python-Laufzeit ein, startet die GUI und erlaubt zielgerichtete oder umfangreiche Diagnoselaeufe gegen deine Server.
+Der MCP Debugger (MCP Diagnoser PRO) ist ein Desktop-Werkzeug, um HTTP/SSE-basierte MCP-Server End-to-End zu testen. Er richtet lokal eine Python-Laufzeit ein, startet die GUI und erlaubt zielgerichtete oder umfangreiche Diagnoselaeufe gegen deine Server – inklusive Streaming-Events.
 
 ### Wichtige Funktionen
 - Windows-Installer-Skript (`setup_and_run.bat`), das eine virtuelle Umgebung aufbaut, Abhaengigkeiten installiert und die GUI startet.
 - Visuelle Oberflaeche zum Ausfuehren einzelner Tool-Calls, Audit-Laeufe und zum Exportieren von Logs.
+- Vollstaendige HTTP- und SSE-Diagnostik (Stream-Capture, Timeouts, Fallbacks).
 - Zertifikats-Helfer (`certgen_ca_server.py`) fuer eine lokale Root-CA und Server-Zertifikate fuer TLS-Tests auf localhost.
 
 ### Test-Schema
 | Bereich | Was geprueft wird | Hinweise |
 | --- | --- | --- |
 | Streaming (SSE) | Verhandelt Event-Streams, erzwingt `sse_max_seconds`, protokolliert Rohdaten. | Prueft Verhalten bei endlosen oder JSON-Fallback-Antworten. |
+| HTTP-Transport | Testet initialize/tool/resource-Endpunkte inkl. TLS-Handshake und Header-Logging. | Hebt Latenzen, TLS-Modus und Wiederholstrategien hervor. |
 | Authentifizierung (OAuth2 / Bearer) | Sendet Requests mit hinterlegten Tokens oder Client-Credentials. | Tokens muessen fuer die Laborumgebung vorgesehen sein; Beschaffung erfolgt extern. |
 | Destruktive Kommandos (Delete / Reset) | Fuehrt Werkzeuge mit Loesch- oder Bereinigungswirkung aus. | Nur auf isolierten Zielsystemen einsetzen; Antworten werden fuer Audits gespeichert. |
 | Fehler- und Validierungspfade | Ruft `rpc/does_not_exist`, fehlerhafte `tools/call` und Schema-Grenzfaelle auf. | Sicherstellt, dass Server JSON-RPC-Fehler liefern statt zu haengen. |
