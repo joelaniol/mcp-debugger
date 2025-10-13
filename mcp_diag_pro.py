@@ -495,7 +495,9 @@ class ProGUI:
         self.auth_header=tk.StringVar(value="Authorization")
 
         self._wizard_active=False
-        self._build(); self._pump()
+        self._build()
+        self._center_window(self.root)
+        self._pump()
         if self.root is not None:
             self.root.after(200, self._show_wizard)
 
@@ -645,6 +647,21 @@ class ProGUI:
 
         tip = ttk.Label(self.root, text="Hinweis: Overall timeout gilt nur für den Gesamtcheck. Bearer nur via TLS.", foreground="#444")
         tip.pack(fill="x", **p)
+
+    def _center_window(self, window):
+        try:
+            window.update_idletasks()
+            w = window.winfo_width()
+            h = window.winfo_height()
+            if w <= 0: w = 800
+            if h <= 0: h = 600
+            sw = window.winfo_screenwidth()
+            sh = window.winfo_screenheight()
+            x = max((sw - w) // 2, 0)
+            y = max((sh - h) // 2, 0)
+            window.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
 
     def _show_wizard(self):
         if self._wizard_active or tk is None:
@@ -1067,6 +1084,7 @@ class SetupWizard(tk.Toplevel):
         self.bind("<Escape>", lambda *_: self._finish())
 
         self._render_step()
+        self.after(0, self._center_on_parent)
         self.grab_set()
         try:
             self.focus_force()
@@ -1226,6 +1244,24 @@ class SetupWizard(tk.Toplevel):
                 return False
             self.gui.url.set(url)
         return True
+
+    def _center_on_parent(self):
+        try:
+            parent = self.gui.root
+            if parent is None:
+                return
+            parent.update_idletasks()
+            self.update_idletasks()
+            pw, ph = parent.winfo_width(), parent.winfo_height()
+            px, py = parent.winfo_rootx(), parent.winfo_rooty()
+            w, h = self.winfo_width(), self.winfo_height()
+            if w <= 0: w = 480
+            if h <= 0: h = 320
+            x = px + max((pw - w)//2, 0)
+            y = py + max((ph - h)//2, 0)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
 
     def _on_tls_selected(self, *_):
         display = self._tls_combo.get()

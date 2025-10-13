@@ -50,6 +50,12 @@ Use the helper to mint a root CA plus localhost server certificate:
 3. Attach client certificates from the generated bundle if your server requires them.
 4. Start with a focused request (for example `tools/list`) before triggering larger audits.
 
+### TLS Modes Explained
+- `System Trust`: Uses the Windows trust store. Ideal when your MCP endpoint has a certificate trusted by the OS.
+- `Embedded CA (./certs/ca.cert.pem)`: Relies on the CA generated via `certgen_ca_server.py`. Use this for localhost testing with self-signed roots.
+- `Pick file...`: Lets you point to any other PEM bundle (for example a corporate CA). The wizard stores the path for reuse.
+- `Insecure (not recommended)`: Disables TLS validation. Only acceptable inside an isolated lab with throwaway data. Never send secrets in this mode.
+
 ### !!! WARNING WARNING WARNING !!!
 The **Run all audit** action executes every available tool and scenario against the selected MCP server. This can trigger security-sensitive or destructive operations.
 
@@ -105,6 +111,12 @@ Erstelle eine Root-CA plus Server-Zertifikat fuer localhost:
 2. Lege ein Profil mit der Ziel-URL deines MCP-Servers an.
 3. Hinterlege bei Bedarf Client-Zertifikate aus dem erzeugten Paket.
 4. Beginne mit einem gezielten Test (z. B. `tools/list`), bevor du grosse Audit-Laeufe startest.
+
+### TLS-Modi erklaert
+- `System Trust`: Verwendet den Windows-Zertifikatsspeicher. Ideal, wenn das MCP-Zertifikat bereits vertrauenswuerdig ist.
+- `Embedded CA (./certs/ca.cert.pem)`: Nutzt die per `certgen_ca_server.py` erzeugte Root-CA. Perfekt fuer lokale Self-Signed-Szenarien.
+- `Pick file...`: Erlaubt das Auswaehlen eines beliebigen PEM-Bundles (z. B. Firmen-CA). Der Pfad wird fuer spaetere Sitzungen gemerkt.
+- `Insecure (not recommended)`: Schaltet TLS-Pruefungen ab. Nur in abgeschotteten Laborumgebungen verwenden und niemals sensible Daten senden.
 
 ### !!! WARNUNG WARNUNG WARNUNG !!!
 Der Button **Run all audit** fuehrt saemtliche verfuegbaren Tools und Szenarien gegen den ausgewaehlten MCP-Server aus. Dabei koennen sicherheitskritische oder destruktive Aktionen angestossen werden.
