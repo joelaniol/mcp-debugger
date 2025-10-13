@@ -65,7 +65,12 @@ class MCP:
         if self.proto: h["MCP-Protocol-Version"]=self.proto
         h.update(self.extra); return h
 
-    def _log_h(self, h): self.sink.write(">> Headers: " + " | ".join([f\"{k}: {v if k.lower()!='authorization' else '***'}\" for k,v in h.items()]))
+    def _log_h(self, h):
+        lines=[]
+        for k,v in h.items():
+            redacted = "***" if k.lower()=="authorization" else v
+            lines.append(f"{k}: {redacted}")
+        self.sink.write(">> Headers: " + " | ".join(lines))
 
     @contextmanager
     def temp_timeout(self, seconds=None):
@@ -459,7 +464,7 @@ class MCP:
             try:
                 orc, rr2 = self.list_resources()
                 ok = rr2.ok and isinstance(orc, dict) and "result" in orc
-                add("OPTIONAL","resources/list", "OK" if ok else "WARN", f"HTTP {getattr(rr2,'status_code','n'a')}")
+                add("OPTIONAL","resources/list", "OK" if ok else "WARN", f"HTTP {getattr(rr2,'status_code','n/a')}")
             except Exception as e:
                 add("OPTIONAL","resources/list", "WARN", str(e))
 
