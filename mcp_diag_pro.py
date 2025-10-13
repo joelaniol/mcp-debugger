@@ -1020,6 +1020,12 @@ class SetupWizard(tk.Toplevel):
         self.custom_ca = tk.StringVar(value=self.gui.ca.get())
         self.tls_choice = tk.StringVar(value=self.gui.tls_mode.get())
         self.tls_choice.trace_add("write", self._update_tls_controls)
+        self._tls_options = [
+            ("System trust store (recommended)", "System Trust"),
+            ("Insecure (accept self-signed certificates)", "Insecure (not recommended)"),
+            ("Use embedded CA from ./certs/ca.cert.pem", "Embedded CA (./certs/ca.cert.pem)"),
+            ("Pick a custom CA bundle…", "Pick file..."),
+        ]
         self.url_choice = tk.StringVar(value=self.gui.url.get())
 
         self.steps = [
@@ -1096,14 +1102,17 @@ class SetupWizard(tk.Toplevel):
 
     def _step_tls_mode(self, frame):
         ttk.Label(frame, text="TLS verification mode", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        options = [
-            ("System trust store (recommended)", "System Trust"),
-            ("Insecure (accept self-signed certificates)", "Insecure (not recommended)"),
-            ("Use embedded CA from ./certs/ca.cert.pem", "Embedded CA (./certs/ca.cert.pem)"),
-            ("Pick a custom CA bundle…", "Pick file..."),
-        ]
-        for text, value in options:
-            ttk.Radiobutton(frame, text=text, variable=self.tls_choice, value=value, wraplength=420, justify="left").pack(anchor="w", pady=(4,0))
+        combo_values=[label for label,_ in self._tls_options]
+        self._tls_combo = ttk.Combobox(frame, state="readonly", values=combo_values, width=46)
+        self._tls_combo.pack(anchor="w", pady=(6,4))
+        current=self.tls_choice.get() or "System Trust"
+        display = next((label for label,value in self._tls_options if value==current), None)
+        if display is None:
+            display = combo_values[0]
+            self.tls_choice.set(next(value for label,value in self._tls_options if label==display))
+        self._tls_combo.set(display)
+        self._tls_combo.bind("<<ComboboxSelected>>", self._on_tls_selected)
+        ttk.Label(frame, text="Choose how certificate validation is performed for MCP connections.", foreground="#444", wraplength=420, justify="left").pack(anchor="w")
         tls_box = ttk.Frame(frame)
         tls_box.pack(fill="x", pady=(10,0))
         ttk.Label(tls_box, text="CA bundle:").pack(side="left")
@@ -1124,7 +1133,7 @@ class SetupWizard(tk.Toplevel):
         summary.pack(anchor="w", pady=(6,0))
         entries = [
             ("Certificates", "Generated locally" if self.cert_choice.get()=="generate" else (self.custom_ca.get() or "Existing path")),
-            ("TLS mode", self.tls_choice.get() or "System Trust"),
+            ("TLS mode", next((label for label,value in self._tls_options if value==self.tls_choice.get()), self.tls_choice.get() or "System Trust")),
             ("MCP server", self.url_choice.get().strip() or self.gui.url.get()),
         ]
         for label, value in entries:
@@ -1168,6 +1177,10 @@ class SetupWizard(tk.Toplevel):
             self._tls_entry.config(state=entry_state)
         if hasattr(self, "_tls_browse"):
             self._tls_browse.config(state="normal" if use_custom else "disabled")
+        if hasattr(self, "_tls_combo"):
+            target = next((label for label,value in self._tls_options if value==self.tls_choice.get()), None)
+            if target:
+                self._tls_combo.set(target)
 
     def _apply_validations(self):
         if self.step_index == 1:
@@ -1197,6 +1210,12 @@ class SetupWizard(tk.Toplevel):
                 return False
             self.gui.url.set(url)
         return True
+
+    def _on_tls_selected(self, *_):
+        display = self._tls_combo.get()
+        value = next((value for label,value in self._tls_options if label==display), None)
+        if value:
+            self.tls_choice.set(value)
 
     def _next(self):
         if not self._apply_validations():
