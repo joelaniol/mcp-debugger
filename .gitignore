@@ -22,3 +22,4 @@ ca_thumbprint.txt
 
 # Miscellaneous installer outputs
 pip-selfcheck.json
+auth_profiles.json
