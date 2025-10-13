@@ -1,5 +1,7 @@
 # MCP Diagnoser v4.2 – Robust gegen strikt validierende Server
 
+> Hinweis: Dieses Repository enthaelt nur die Setup- und Installationsbasis. Alle beim Einrichten entstehenden Artefakte (z. B. virtuelle Umgebungen oder Zertifikate) gehoeren nicht in Git und werden ueber .gitignore ausgeschlossen.
+
 **Fixes**
 - **Overall Summary hing bei 'rpc/does_not_exist'** auf streng typisierten Servern (Pydantic‑Validierung).
   - Der Fehler‑Probeaufruf nutzt nun **JSON‑only** (`Accept: application/json`) und **kein Streaming**.
