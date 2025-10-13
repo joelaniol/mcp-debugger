@@ -1,0 +1,4 @@
+requests
+sseclient-py
+cryptography
+jsonschema>=4.21.1

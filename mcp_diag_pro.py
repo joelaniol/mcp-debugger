@@ -1,0 +1,1058 @@
+import argparse, json, time, threading, queue, sys, os, logging, zipfile, concurrent.futures, shlex, warnings
+from contextlib import contextmanager
+import requests
+from sseclient import SSEClient
+from jsonschema import Draft7Validator
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    from tkinter.scrolledtext import ScrolledText
+except Exception:
+    tk = None
+    ttk = None
+    filedialog = None
+    ScrolledText = None
+    messagebox = None
+
+DEFAULT_PROTOCOL_VERSION = "2025-06-18"
+
+def ts():
+    return time.strftime("%H:%M:%S")
+
+class Sink:
+    def __init__(self, gui_cb=None, mem_log=None):
+        self.gui_cb=gui_cb
+        self.mem_log = mem_log if mem_log is not None else []
+    def write(self, line):
+        msg = f"[{ts()}] {line}"
+        print(msg, flush=True)
+        self.mem_log.append(msg)
+        if self.gui_cb: self.gui_cb(msg)
+
+class MCP:
+    def __init__(self, url, verify=True, timeout=30.0, extra=None, sink=None, verbose=False):
+        self.url=url; self.verify=verify; self.timeout=timeout
+        self.extra=dict(extra or {}); self.sid=""; self.proto=""; self._id=1
+        self.sink=sink or Sink()
+        self.verbose = verbose
+        self.last_request = None
+        self.last_http = None
+        self.last_body = None
+        self._id_lock = threading.Lock()
+
+    def _setup_logging(self):
+        lvl = logging.DEBUG if self.verbose else logging.WARNING
+        logging.basicConfig(level=lvl)
+        for name in ["urllib3","requests","requests.packages.urllib3"]:
+            try: logging.getLogger(name).setLevel(lvl)
+            except Exception: pass
+
+    def _next(self):
+        with self._id_lock:
+            i=self._id; self._id+=1; return i
+
+    def _h_post(self, include_sid=True, include_proto=True, is_init=False, accept_json_only=False):
+        accept = "application/json" if accept_json_only else "application/json, text/event-stream"
+        h={"Accept": accept, "Content-Type":"application/json"}
+        if include_sid and self.sid: h["Mcp-Session-Id"]=self.sid
+        if include_proto and self.proto and not is_init: h["MCP-Protocol-Version"]=self.proto
+        h.update(self.extra); return h
+
+    def _h_get(self):
+        h={"Accept":"text/event-stream"}
+        if self.sid: h["Mcp-Session-Id"]=self.sid
+        if self.proto: h["MCP-Protocol-Version"]=self.proto
+        h.update(self.extra); return h
+
+    def _log_h(self, h): self.sink.write(">> Headers: " + " | ".join([f\"{k}: {v if k.lower()!='authorization' else '***'}\" for k,v in h.items()]))
+
+    @contextmanager
+    def temp_timeout(self, seconds=None):
+        old=self.timeout
+        if seconds is not None: self.timeout = float(seconds)
+        try: yield
+        finally: self.timeout = old
+
+    def _curl_from_http(self, http_obj, redact=True, windows=False):
+        if not http_obj: return ""
+        m=http_obj.get("method","POST")
+        url=http_obj.get("url", self.url)
+        headers=http_obj.get("headers",{})
+        body=http_obj.get("body",None)
+        lines=[]
+        if windows:
+            lines.append(f'curl -X {m} "{url}" ^')
+            for k,v in headers.items():
+                val = v if k.lower()!="authorization" or not redact else "***"
+                lines.append(f'  -H "{k}: {val}" ^')
+            if body is not None:
+                payload=json.dumps(body, separators=(",",":"))
+                lines.append(f'  --data-raw "{payload}"')
+        else:
+            lines.append(f"curl -X {shlex.quote(m)} {shlex.quote(url)} \\")
+            for k,v in headers.items():
+                val = v if k.lower()!="authorization" or not redact else "***"
+                lines.append(f"  -H {shlex.quote(f'{k}: {val}')} \\")
+            if body is not None:
+                payload=json.dumps(body, separators=(",",":"))
+                lines.append(f"  --data-raw {shlex.quote(payload)}")
+            else:
+                if lines[-1].endswith("\\"):
+                    lines[-1]=lines[-1][:-2]
+        return "\n".join(lines)
+
+    def last_curl(self, redact=True, windows=False):
+        return self._curl_from_http(self.last_http, redact=redact, windows=windows)
+
+    def initialize(self, protocol_version=DEFAULT_PROTOCOL_VERSION):
+        self._setup_logging()
+        payload={"jsonrpc":"2.0","id":self._next(),"method":"initialize","params":{"protocolVersion":protocol_version,"capabilities":{},"clientInfo":{"name":"mcp-diagnoser-pro","version":"0.4.2"}}}
+        h=self._h_post(include_sid=False, include_proto=False, is_init=True)
+        self.last_request={"method":"initialize","headers":h,"payload":payload}
+        self.last_http={"method":"POST","url":self.url,"headers":h.copy(),"body":payload}
+        self.sink.write(f">> POST {self.url} [initialize]"); self._log_h(h)
+        self.sink.write(">> Body: " + json.dumps(payload, ensure_ascii=False))
+        r=requests.post(self.url, data=json.dumps(payload), headers=h, stream=True, verify=self.verify, timeout=self.timeout)
+        self.sink.write(f"<< HTTP {r.status_code}  Content-Type: {r.headers.get('Content-Type','')}")
+        sid=r.headers.get("Mcp-Session-Id",""); 
+        if sid: self.sid=sid; self.sink.write(f"<< Mcp-Session-Id: {sid}")
+        ct=(r.headers.get("Content-Type") or "").lower()
+        obj={}
+        if "text/event-stream" in ct:
+            client=SSEClient(r)
+            for ev in client.events():
+                try:
+                    d=json.loads(ev.data); self.sink.write(f"<< [SSE {ev.event or 'message'}] " + json.dumps(d, ensure_ascii=False))
+                    if isinstance(d,dict) and d.get("id")==payload["id"] and ("result" in d or "error" in d): obj=d; break
+                except Exception:
+                    self.sink.write("<< [SSE raw] " + ev.data)
+        else:
+            try: obj=r.json()
+            except Exception: obj={"_raw": r.text}
+            self.sink.write("<< Body: " + json.dumps(obj, ensure_ascii=False))
+        self.last_body = obj
+        if isinstance(obj,dict) and obj.get("result"):
+            pv=obj["result"].get("protocolVersion") or ""
+            if pv: self.proto=pv; self.sink.write(f"<< Negotiated MCP-Protocol-Version: {pv}")
+        return obj, r
+
+    def initialized(self):
+        payload={"jsonrpc":"2.0","method":"notifications/initialized"}
+        h=self._h_post()
+        self.last_request={"method":"notifications/initialized","headers":h,"payload":payload}
+        self.last_http={"method":"POST","url":self.url,"headers":h.copy(),"body":payload}
+        self.sink.write(f">> POST {self.url} [notifications/initialized]"); self._log_h(h)
+        self.sink.write(">> Body: " + json.dumps(payload, ensure_ascii=False))
+        r=requests.post(self.url, data=json.dumps(payload), headers=h, stream=False, verify=self.verify, timeout=self.timeout)
+        self.sink.write(f"<< HTTP {r.status_code} (initialized)")
+        return r
+
+    def call(self, method, params=None, stream=True, accept_json_only=False, sse_max_seconds=None):
+        payload={"jsonrpc":"2.0","id":self._next(),"method":method}
+        if params is not None: payload["params"]=params
+        h=self._h_post(accept_json_only=accept_json_only)
+        self.last_request={"method":method,"headers":h,"payload":payload}
+        self.last_http={"method":"POST","url":self.url,"headers":h.copy(),"body":payload}
+        self.sink.write(f">> POST {self.url} [{method}]"); self._log_h(h)
+        self.sink.write(">> Body: " + json.dumps(payload, ensure_ascii=False))
+        if self.sid: self.sink.write(f">> Using session: {self.sid}")
+        r=requests.post(self.url, data=json.dumps(payload), headers=h, stream=stream, verify=self.verify, timeout=self.timeout)
+        self.sink.write(f"<< HTTP {r.status_code}  Content-Type: {r.headers.get('Content-Type','')}")
+        ct=(r.headers.get("Content-Type") or "").lower()
+
+        # If server unexpectedly returns SSE but we explicitly asked JSON-only or stream=False, don't block
+        if "text/event-stream" in ct and (accept_json_only or not stream):
+            self.sink.write("<< WARN: Unexpected text/event-stream for non-stream call; capturing raw body.")
+            try:
+                raw = r.text
+            except Exception:
+                raw = "<streaming>"
+            obj={"_raw": raw, "_note":"unexpected event-stream for non-stream/json-only call"}
+            self.last_body=obj
+            return obj, r
+
+        if "text/event-stream" in ct:
+            client=SSEClient(r)
+            deadline = time.time() + (sse_max_seconds or 30)
+            for ev in client.events():
+                try:
+                    d=json.loads(ev.data); self.last_body=d; self.sink.write(f"<< [SSE {ev.event or 'message'}] " + json.dumps(d, ensure_ascii=False))
+                    if isinstance(d,dict) and d.get("id")==payload["id"] and ("result" in d or "error" in d):
+                        return d, r
+                except Exception:
+                    self.sink.write(f"<< [SSE raw] {ev.data}")
+                if time.time() >= deadline:
+                    self.sink.write("<< WARN: SSE read timed out; continuing.")
+                    break
+            return {}, r
+        else:
+            try: obj=r.json()
+            except Exception: obj={"_raw": r.text}
+            self.last_body = obj
+            self.sink.write("<< Body: " + json.dumps(obj, ensure_ascii=False))
+            return obj, r
+
+    def list_tools(self): return self.call("tools/list", {"cursor": None}, sse_max_seconds=5)
+    def list_resources(self): return self.call("resources/list", {"cursor": None}, sse_max_seconds=5)
+    def list_prompts(self): return self.call("prompts/list", {"cursor": None}, sse_max_seconds=5)
+
+    def get_sse(self, seconds=3):
+        h=self._h_get()
+        self.last_http={"method":"GET","url":self.url,"headers":h.copy(),"body":None}
+        self.sink.write(f">> GET {self.url} [SSE] {seconds}s"); self._log_h(h)
+        r=requests.get(self.url, headers=h, stream=True, verify=self.verify, timeout=self.timeout)
+        self.sink.write(f"<< HTTP {r.status_code}  Content-Type: {r.headers.get('Content-Type','')}")
+        ct=(r.headers.get("Content-Type") or "").lower()
+        if "text/event-stream" not in ct:
+            self.sink.write("<< Kein text/event-stream (405 oder JSON)."); return r
+        client=SSEClient(r); end=time.time()+max(0,seconds)
+        for ev in client.events():
+            try: d=json.loads(ev.data); self.last_body=d; self.sink.write(f"<< [SSE {ev.event or 'message'}] " + json.dumps(d, ensure_ascii=False))
+            except Exception: self.sink.write("<< [SSE raw] " + ev.data)
+            if seconds and time.time()>=end: break
+        return r
+
+    def delete_session(self):
+        h=self._h_post()
+        self.last_http={"method":"DELETE","url":self.url,"headers":h.copy(),"body":None}
+        self.sink.write(f">> DELETE {self.url} [session]"); self._log_h(h)
+        r=requests.delete(self.url, headers=h, verify=self.verify, timeout=self.timeout)
+        self.sink.write(f"<< HTTP {r.status_code} (DELETE)")
+        return r
+
+    def _gen_from_schema(self, schema):
+        def gen(sch):
+            if not isinstance(sch, dict): return None
+            if "default" in sch: return sch["default"]
+            if "enum" in sch and sch["enum"]: return sch["enum"][0]
+            t = sch.get("type")
+            if isinstance(t, list): t=t[0]
+            if t=="string": return "x"
+            if t=="integer": return 0
+            if t=="number": return 0.0
+            if t=="boolean": return False
+            if t=="array":
+                it = sch.get("items")
+                v = gen(it) if isinstance(it, dict) else None
+                mi = int(sch.get("minItems", 0))
+                arr = [v] if mi>0 else ([] if v is None else [v])
+                while len(arr)<mi: arr.append(v)
+                return arr
+            if t=="object" or "properties" in sch or "required" in sch:
+                out={}
+                props = sch.get("properties", {})
+                for req in sch.get("required", []):
+                    out[req] = gen(props.get(req, {}))
+                return out
+            if "oneOf" in sch: return gen(sch["oneOf"][0])
+            if "anyOf" in sch: return gen(sch["anyOf"][0])
+            if "allOf" in sch: 
+                res={}
+                for p in sch["allOf"]:
+                    x=gen(p)
+                    if isinstance(x, dict): res.update(x)
+                return res
+            return {}
+        return gen(schema or {})
+
+    def _validate(self, schema, instance):
+        try:
+            Draft7Validator(schema or {}).validate(instance)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def _extract_structured_from_result(self, tool_result):
+        if not isinstance(tool_result, dict): return None
+        if "structuredContent" in tool_result and isinstance(tool_result["structuredContent"], (dict, list)):
+            return tool_result["structuredContent"]
+        content = tool_result.get("content") or []
+        for item in content:
+            if isinstance(item, dict) and item.get("type")=="text":
+                txt=item.get("text","")
+                if not isinstance(txt, str): continue
+                txt=txt.strip()
+                if not (txt.startswith("{") or txt.startswith("[")): continue
+                try:
+                    data=json.loads(txt)
+                    if isinstance(data, (dict, list)):
+                        return data
+                except Exception:
+                    continue
+        return None
+
+    def audit_tools(self, limit=None, per_call_timeout=None, parallelism=1, stop_flag=None, on_progress=None, validate_outputs=True):
+        tools_obj, _ = self.list_tools()
+        tools = (tools_obj.get("result") or {}).get("tools") or []
+        if limit: tools = tools[:max(0, int(limit))]
+
+        results = []
+
+        def worker(t):
+            if stop_flag and stop_flag(): 
+                return None
+            name = t.get("name","")
+            schema = t.get("inputSchema") or {}
+            out_schema = t.get("outputSchema") or None
+            args = self._gen_from_schema(schema)
+            ok, err = self._validate(schema, args)
+            status = "ARGS_VALID" if ok else "ARGS_INVALID"
+            detail = "" if ok else err or "Validation failed"
+            ms = 0
+            kb = 0.0
+            if not ok:
+                res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"args":args,"http":None}
+                if on_progress: on_progress(res)
+                return res
+            try:
+                start=time.monotonic()
+                obj, resp = self.call("tools/call", {"name": name, "arguments": args}, sse_max_seconds=20)
+                ms = int(round((time.monotonic()-start)*1000))
+                try:
+                    ct=(resp.headers.get("Content-Type") or "").lower()
+                except Exception:
+                    ct=""
+                try:
+                    if "application/json" in ct:
+                        kb = (len(resp.content or b"")/1024.0)
+                    else:
+                        kb = (len(json.dumps(obj).encode("utf-8"))/1024.0)
+                except Exception:
+                    kb = 0.0
+
+                if resp.ok:
+                    out_status=None; out_detail=None
+                    if isinstance(obj, dict) and "error" in obj:
+                        status="PROTOCOL_ERROR"; detail=f"{obj['error'].get('code')} {obj['error'].get('message')}"
+                    else:
+                        rres = (obj.get("result") or {}) if isinstance(obj, dict) else {}
+                        if isinstance(rres, dict) and rres.get("isError"):
+                            status="TOOL_ERROR"; detail="isError=true"
+                        else:
+                            status="OK"; detail="call succeeded"
+                            if validate_outputs and out_schema:
+                                structured = self._extract_structured_from_result(rres)
+                                if structured is None:
+                                    out_status="NO_STRUCTURED"; out_detail="no structuredContent / parsable JSON text"
+                                else:
+                                    v_ok, v_err = self._validate(out_schema, structured)
+                                    if v_ok: out_status="OUTPUT_VALID"; out_detail=""
+                                    else: out_status="OUTPUT_SCHEMA_INVALID"; out_detail=v_err or "schema validation failed"
+                    if out_status:
+                        detail = (detail + ("; " if detail else "") + f"{out_status}: {out_detail}").strip("; ")
+                else:
+                    status="HTTP_ERROR"; detail=f"HTTP {resp.status_code}"
+                res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"args":args,"http":resp.status_code}
+            except requests.exceptions.Timeout as e:
+                ms = int(round((time.monotonic()-start)*1000))
+                res={"tool":name,"status":"TIMEOUT","detail":str(e),"ms":ms,"kb":0.0,"args":args,"http":None}
+            except Exception as e:
+                ms = int(round((time.monotonic()-start)*1000))
+                res={"tool":name,"status":"EXCEPTION","detail":str(e),"ms":ms,"kb":0.0,"args":args,"http":None}
+            if on_progress: on_progress(res)
+            return res
+
+        if parallelism<=1:
+            for t in tools:
+                if stop_flag and stop_flag(): break
+                r = worker(t)
+                if r: results.append(r)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=parallelism) as ex:
+                futs = [ex.submit(worker, t) for t in tools]
+                for f in concurrent.futures.as_completed(futs):
+                    r = f.result()
+                    if r: results.append(r)
+        return results
+
+    def overall(self, timeout_override=None):
+        summary=[]; details={}
+        def add(level, name, status, detail):
+            summary.append({"level":level,"check":name,"status":status,"detail":detail})
+
+        with (self.temp_timeout(timeout_override) if timeout_override is not None else self.temp_timeout(None)):
+            try:
+                obj, r = self.initialize()
+                details["initialize"]={"http":r.status_code,"headers":dict(r.headers),"body":obj}
+                j_ok = isinstance(obj, dict) and obj.get("jsonrpc")=="2.0" and ("result" in obj or "error" in obj)
+                add("MUST","JSON-RPC 2.0 response", "OK" if j_ok else "FAIL", "jsonrpc='2.0' & result|error required")
+                h=self.last_http.get("headers",{}) if self.last_http else {}
+                acc=h.get("Accept",""); ct=h.get("Content-Type","")
+                add("MUST","Accept header", "OK" if ("application/json" in acc and "text/event-stream" in acc) else "FAIL", acc or "missing")
+                add("MUST","Content-Type header", "OK" if ct.lower()=="application/json" else "FAIL", ct or "missing")
+                pv=(obj.get("result") or {}).get("protocolVersion") if isinstance(obj,dict) else None
+                add("MUST","Protocol-Version negotiated", "OK" if isinstance(pv,str) and pv else "FAIL", pv or "missing")
+                caps=(obj.get("result") or {}).get("capabilities") if isinstance(obj,dict) else None
+                add("MUST","Capabilities object in InitializeResult", "OK" if isinstance(caps, dict) else "FAIL", "present" if isinstance(caps,dict) else "missing")
+                s_info=(obj.get("result") or {}).get("serverInfo") if isinstance(obj,dict) else None
+                add("SHOULD","serverInfo provided", "OK" if isinstance(s_info, dict) else "WARN", "present" if isinstance(s_info,dict) else "absent")
+            except Exception as e:
+                add("MUST","initialize", "FAIL", str(e))
+                return summary, details
+
+            try:
+                rr=self.initialized(); details["initialized"]={"http":rr.status_code}
+                add("MUST","notifications/initialized -> 202", "OK" if rr.status_code==202 else "FAIL", f"HTTP {rr.status_code}")
+            except Exception as e:
+                add("MUST","notifications/initialized", "FAIL", str(e))
+
+            tools=[]
+            try:
+                o,r=self.list_tools(); details["tools/list"]={"http":r.status_code,"headers":dict(r.headers),"body":o}
+                tools=((o.get("result") or {}).get("tools") or []) if isinstance(o,dict) else []
+                has_tools_cap = isinstance(caps,dict) and isinstance(caps.get("tools"), dict)
+                if has_tools_cap or (isinstance(tools, list) and len(tools)>0):
+                    add("MUST","tools/list returns list", "OK" if isinstance(tools,list) else "FAIL", f"count={len(tools) if isinstance(tools,list) else 'n/a'}")
+                else:
+                    add("OPTIONAL","tools/list (no tools advertised)", "OK" if r.ok else "WARN", f"HTTP {r.status_code}")
+            except Exception as e:
+                add("MUST","tools/list", "FAIL", str(e))
+
+            if isinstance(tools, list) and tools:
+                t=tools[0]; name=t.get("name")
+                try:
+                    obj, resp = self.call("tools/call", {"name": name, "arguments": {}}, stream=True, sse_max_seconds=15)
+                    ok = resp.ok and isinstance(obj, dict) and ("result" in obj or "error" in obj)
+                    add("MUST","tools/call JSON-RPC", "OK" if ok else "FAIL", f"HTTP {getattr(resp,'status_code', 'n/a')}")
+                except Exception as e:
+                    add("MUST","tools/call", "FAIL", str(e))
+            else:
+                add("OPTIONAL","tools/call (no tools)", "OK", "skipped")
+
+            # Robust error-object probe: try unknown method JSON-only; fallback to invalid params
+            try:
+                bad, br = self.call("rpc/does_not_exist", {}, stream=False, accept_json_only=True)
+                err_ok = isinstance(bad, dict) and isinstance(bad.get("error"), dict) and ("code" in bad["error"] and "message" in bad["error"])
+                if not err_ok:
+                    # fallback: provoke invalid params on tools/call
+                    bad2, br2 = self.call("tools/call", {"arguments": {"_":1}}, stream=False, accept_json_only=True)
+                    err_ok = isinstance(bad2, dict) and isinstance(bad2.get("error"), dict) and ("code" in bad2["error"] and "message" in bad2["error"])
+                    add("MUST","JSON-RPC error format", "OK" if err_ok else "FAIL", json.dumps(bad2 if err_ok else bad)[:200])
+                else:
+                    add("MUST","JSON-RPC error format", "OK", json.dumps(bad)[:200])
+            except Exception as e:
+                add("MUST","JSON-RPC error format", "WARN", f"probe failed: {e}")
+
+            try:
+                r=self.get_sse(1); details["GET-SSE"]={"http":r.status_code,"headers":dict(r.headers)}
+                ct=(r.headers.get("Content-Type") or "").lower()
+                if "text/event-stream" in ct or r.status_code==405:
+                    add("MUST","HTTP SSE endpoint behavior", "OK", "event-stream or 405")
+                else:
+                    add("MUST","HTTP SSE endpoint behavior", "FAIL", f"{r.status_code} {ct}")
+            except Exception as e:
+                add("MUST","HTTP SSE endpoint", "FAIL", str(e))
+
+            try:
+                sid_present = bool(details.get("initialize",{}).get("headers",{}).get("Mcp-Session-Id") or self.sid)
+                add("SHOULD","Mcp-Session-Id issued", "OK" if sid_present else "WARN", "present" if sid_present else "not issued")
+            except Exception as e:
+                add("SHOULD","Mcp-Session-Id", "WARN", str(e))
+
+            try:
+                op, rp = self.list_prompts()
+                ok = rp.ok and isinstance(op, dict) and "result" in op
+                add("OPTIONAL","prompts/list", "OK" if ok else "WARN", f"HTTP {getattr(rp,'status_code','n/a')}")
+            except Exception as e:
+                add("OPTIONAL","prompts/list", "WARN", str(e))
+            try:
+                orc, rr2 = self.list_resources()
+                ok = rr2.ok and isinstance(orc, dict) and "result" in orc
+                add("OPTIONAL","resources/list", "OK" if ok else "WARN", f"HTTP {getattr(rr2,'status_code','n'a')}")
+            except Exception as e:
+                add("OPTIONAL","resources/list", "WARN", str(e))
+
+            try:
+                r=self.delete_session(); details["DELETE"]={"http":r.status_code}
+                add("OPTIONAL","DELETE session", "OK" if 200 <= r.status_code < 400 else "WARN", f"HTTP {r.status_code}")
+            except Exception as e:
+                add("OPTIONAL","DELETE session", "WARN", str(e))
+
+        return summary, details
+
+# ---------------- GUI ----------------
+class ProGUI:
+    def __init__(self, root):
+        self.root=root; self.root.title("MCP Diagnoser v4.2")
+        self.mem_log=[]
+        self.q=queue.Queue(); self.client=None; self.last_report=None
+        self._audit_stop=False
+        self._build(); self._pump()
+
+    def _sink(self, m):
+        self.mem_log.append(m)
+        self.q.put(m)
+
+    def _pump(self):
+        try:
+            while True:
+                m=self.q.get_nowait()
+                self.console.insert("end", m+"\n"); self.console.see("end")
+        except queue.Empty: pass
+        self.root.after(60, self._pump)
+
+    def _build(self):
+        p={"padx":6,"pady":4}
+        top=ttk.Frame(self.root); top.pack(fill="x", **p)
+        ttk.Label(top, text="MCP URL:").grid(row=0, column=0, sticky="w")
+        self.url=tk.StringVar(value="https://localhost:5000/mcp")
+        ttk.Entry(top, textvariable=self.url, width=50).grid(row=0, column=1, columnspan=2, sticky="we")
+
+        ttk.Label(top, text="TLS Mode:").grid(row=0, column=3, sticky="e")
+        self.tls_mode=tk.StringVar(value="System Trust")
+        tls=ttk.Combobox(top, textvariable=self.tls_mode, state="readonly",
+                         values=["System Trust","Insecure (not recommended)","Embedded CA (./certs/ca.cert.pem)","Pick file..."], width=28)
+        tls.grid(row=0, column=4, sticky="we")
+
+        ttk.Label(top, text="Timeout (s):").grid(row=0, column=5, sticky="e")
+        self.timeout=tk.StringVar(value="30")
+        ttk.Entry(top, textvariable=self.timeout, width=6).grid(row=0, column=6, sticky="w")
+
+        ttk.Label(top, text="Overall timeout (s):").grid(row=0, column=7, sticky="e")
+        self.overall_timeout=tk.StringVar(value="30")
+        ttk.Entry(top, textvariable=self.overall_timeout, width=6).grid(row=0, column=8, sticky="w")
+
+        ttk.Label(top, text="CA-Bundle:").grid(row=1, column=0, sticky="w")
+        self.ca=tk.StringVar(value="")
+        ttk.Entry(top, textvariable=self.ca, width=50).grid(row=1, column=1, columnspan=2, sticky="we")
+        ttk.Button(top, text="…", width=3, command=self._pick_ca).grid(row=1, column=3, sticky="w")
+        ttk.Button(top, text="Generate CA+Server", command=self._gen_ca).grid(row=1, column=4, sticky="w")
+        ttk.Button(top, text="Clear console", command=self._clear).grid(row=1, column=5, sticky="w")
+
+        ttk.Label(top, text="Auth:").grid(row=2, column=0, sticky="e")
+        self.auth_mode=tk.StringVar(value="None")
+        self.auth_combo=ttk.Combobox(top, textvariable=self.auth_mode, state="readonly", values=["None","Bearer","Custom header"], width=14)
+        self.auth_combo.grid(row=2, column=1, sticky="w")
+        ttk.Label(top, text="Token:").grid(row=2, column=2, sticky="e")
+        self.auth_token=tk.StringVar(value="")
+        self.auth_entry=ttk.Entry(top, textvariable=self.auth_token, show="*", width=28)
+        self.auth_entry.grid(row=2, column=3, sticky="we")
+        ttk.Label(top, text="Header-Name:").grid(row=2, column=4, sticky="e")
+        self.auth_header=tk.StringVar(value="Authorization")
+        self.auth_header_entry=ttk.Entry(top, textvariable=self.auth_header, width=18)
+        self.auth_header_entry.grid(row=2, column=5, sticky="w")
+        ttk.Button(top, text="Apply auth", command=self._apply_auth).grid(row=2, column=6, sticky="w")
+
+        prof=ttk.Frame(self.root); prof.pack(fill="x", **p)
+        ttk.Label(prof, text="Profiles:").pack(side="left")
+        ttk.Button(prof, text="Save (per URL)", command=self._save_profile).pack(side="left")
+        ttk.Button(prof, text="Load", command=self._load_profile).pack(side="left")
+        ttk.Button(prof, text="Delete", command=self._delete_profile).pack(side="left")
+        ttk.Label(prof, text="⚠ Token wird lokal im Klartext gespeichert. Nur auf vertrauenswürdigen Geräten.").pack(side="left")
+
+        body=ttk.PanedWindow(self.root, orient="horizontal"); body.pack(fill="both", expand=True, **p)
+        left=ttk.Frame(body); right=ttk.Frame(body)
+        body.add(left, weight=1); body.add(right, weight=2)
+
+        ttk.Label(left, text="Checks & Samples").pack(anchor="w")
+        self.tree=ttk.Treeview(left, show="tree")
+        self.tree.pack(fill="both", expand=True)
+        h = self.tree.insert("", "end", text="Handshake", open=True)
+        self.tree.insert(h, "end", iid="init", text="POST initialize")
+        self.tree.insert(h, "end", iid="initialized", text="notifications/initialized")
+        l = self.tree.insert("", "end", text="Lists", open=True)
+        self.tree.insert(l, "end", iid="tools_list", text="tools/list")
+        self.tree.insert(l, "end", iid="resources_list", text="resources/list")
+        self.tree.insert(l, "end", iid="prompts_list", text="prompts/list")
+        s = self.tree.insert("", "end", text="Samples", open=True)
+        self.tree.insert(s, "end", iid="prompts_get_first", text="prompts/get (1st)")
+        self.tree.insert(s, "end", iid="resources_read_first", text="resources/read (1st)")
+        self.tree.insert(s, "end", iid="tools_call_first", text="tools/call (1st, empty args)")
+        a = self.tree.insert("", "end", text="Audit", open=True)
+        self.tree.insert(a, "end", iid="audit_tools", text="Audit all tools (schema→args→validate→call)")
+        m = self.tree.insert("", "end", text="Misc", open=True)
+        self.tree.insert(m, "end", iid="get_sse", text="GET SSE (3s)")
+        self.tree.insert(m, "end", iid="delete_session", text="DELETE session")
+
+        btns=ttk.Frame(left); btns.pack(fill="x")
+        ttk.Button(btns, text="Run selected", command=self._run_selected).pack(side="left")
+        ttk.Button(btns, text="Run all", command=self._run_all).pack(side="left")
+        ttk.Button(btns, text="Reset session", command=self._reset_session).pack(side="right")
+
+        ttk.Label(left, text="Overall Test Summary").pack(anchor="w")
+        self.summary=ttk.Treeview(left, columns=("check","level","status","detail"), show="headings", height=10)
+        self.summary.heading("check", text="Check")
+        self.summary.heading("level", text="Level")
+        self.summary.heading("status", text="Status")
+        self.summary.heading("detail", text="Detail")
+        self.summary.column("check", width=260, anchor="w")
+        self.summary.column("level", width=80, anchor="center")
+        self.summary.column("status", width=120, anchor="center")
+        self.summary.column("detail", width=380, anchor="w")
+        self.summary.tag_configure("ok", foreground="#0A7D00")
+        self.summary.tag_configure("warn", foreground="#C27C00")
+        self.summary.tag_configure("err", foreground="#B00020")
+        self.summary.pack(fill="both", expand=False)
+        sumbtns=ttk.Frame(left); sumbtns.pack(fill="x")
+        ttk.Button(sumbtns, text="Run overall test", command=self._run_overall).pack(side="left")
+        ttk.Button(sumbtns, text="Run auth tests", command=self._run_auth_tests).pack(side="left")
+        ttk.Button(sumbtns, text="Save report (ZIP)", command=self._save_report).pack(side="left")
+        ttk.Button(sumbtns, text="Clear summary", command=lambda: self.summary.delete(*self.summary.get_children())).pack(side="left")
+
+        ttk.Label(left, text="Audit results (per tool)").pack(anchor="w")
+        self.audit=ttk.Treeview(left, columns=("tool","status","ms","kb","detail"), show="headings", height=12)
+        self.audit.heading("tool", text="Tool")
+        self.audit.heading("status", text="Status")
+        self.audit.heading("ms", text="ms")
+        self.audit.heading("kb", text="KB")
+        self.audit.heading("detail", text="Detail")
+        self.audit.column("tool", width=220, anchor="w")
+        self.audit.column("status", width=130, anchor="center")
+        self.audit.column("ms", width=70, anchor="center")
+        self.audit.column("kb", width=90, anchor="center")
+        self.audit.column("detail", width=280, anchor="w")
+        self.audit.tag_configure("ok", foreground="#0A7D00")
+        self.audit.tag_configure("err", foreground="#B00020")
+        self.audit.pack(fill="both", expand=True)
+
+        audcfg=ttk.Frame(left); audcfg.pack(fill="x")
+        ttk.Label(audcfg, text="Per-Tool Timeout (s):").pack(side="left")
+        self.audit_timeout=tk.StringVar(value="10")
+        ttk.Entry(audcfg, textvariable=self.audit_timeout, width=5).pack(side="left")
+        ttk.Label(audcfg, text="Parallelism:").pack(side="left")
+        self.audit_parallel=tk.StringVar(value="4")
+        ttk.Entry(audcfg, textvariable=self.audit_parallel, width=3).pack(side="left")
+        self.audit_progress=tk.StringVar(value="")
+        ttk.Label(audcfg, textvariable=self.audit_progress).pack(side="right")
+        audbtns=ttk.Frame(left); audbtns.pack(fill="x")
+        ttk.Button(audbtns, text="Run audit", command=self._run_audit).pack(side="left")
+        ttk.Button(audbtns, text="Stop audit", command=self._stop_audit).pack(side="left")
+        ttk.Button(audbtns, text="Clear audit", command=lambda: self.audit.delete(*self.audit.get_children())).pack(side="left")
+
+        ttk.Label(right, text="JSON-RPC Payload (für POST-Sample):").pack(anchor="w")
+        self.payload=ScrolledText(right, height=10); self.payload.pack(fill="x")
+        self._prefill_payload()
+
+        rightbtns=ttk.Frame(right); rightbtns.pack(fill="x")
+        ttk.Button(rightbtns, text="Open Tree Viewer (last JSON)", command=self._open_tree).pack(side="left")
+        ttk.Button(rightbtns, text="Show cURL (last request)", command=self._show_curl).pack(side="left")
+        ttk.Button(rightbtns, text="Save last request (.http)", command=self._save_httpfile).pack(side="left")
+
+        ttk.Label(right, text="Console:").pack(anchor="w")
+        self.console=ScrolledText(right, height=24); self.console.pack(fill="both", expand=True)
+
+        tip = ttk.Label(self.root, text="Hinweis: Overall timeout gilt nur für den Gesamtcheck. Bearer nur via TLS.", foreground="#444")
+        tip.pack(fill="x", **p)
+
+    def _prefill_payload(self):
+        pl={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":DEFAULT_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"mcp-diagnoser-pro","version":"0.4.2"}}}
+        self.payload.delete("1.0","end"); self.payload.insert("1.0", json.dumps(pl, indent=2))
+
+    def _clear(self): self.console.delete("1.0","end"); self.mem_log.clear()
+    def _reset_session(self): self.client=None; self._sink("Session-Objekt zurückgesetzt.")
+
+    def _pick_ca(self):
+        p=filedialog.askopenfilename(title="CA-Bundle wählen", filetypes=[("Zertifikate","*.pem *.crt *.cer *.ca-bundle"),("Alle Dateien","*.*")])
+        if p: self.ca.set(p)
+
+    def _gen_ca(self):
+        try:
+            from certgen_ca_server import make_ca, make_server_cert, sha1_thumbprint
+            from cryptography.hazmat.primitives import serialization
+            out=os.path.join(os.path.dirname(__file__),"certs")
+            os.makedirs(out, exist_ok=True)
+            ca_key, ca_cert = make_ca("localhost", 3650)
+            server_key, server_cert = make_server_cert(ca_key, ca_cert, "localhost", 3650)
+            with open(os.path.join(out,"ca.key.pem"),"wb") as f:
+                f.write(ca_key.private_bytes(encoding=serialization.Encoding.PEM,format=serialization.PrivateFormat.TraditionalOpenSSL,encryption_algorithm=serialization.NoEncryption()))
+            with open(os.path.join(out,"ca.cert.pem"),"wb") as f:
+                f.write(ca_cert.public_bytes(serialization.Encoding.PEM))
+            with open(os.path.join(out,"localhost.key.pem"),"wb") as f:
+                f.write(server_key.private_bytes(encoding=serialization.Encoding.PEM,format=serialization.PrivateFormat.TraditionalOpenSSL,encryption_algorithm=serialization.NoEncryption()))
+            with open(os.path.join(out,"localhost.cert.pem"),"wb") as f:
+                f.write(server_cert.public_bytes(serialization.Encoding.PEM))
+            with open(os.path.join(out,"ca_thumbprint.txt"),"w",encoding="utf-8") as f:
+                f.write(sha1_thumbprint(ca_cert))
+            self._sink("CA + Server-Zertifikat unter ./certs erzeugt.")
+        except Exception as e:
+            self._sink(f"Zertifikatsfehler: {e}")
+
+    def _profiles_path(self): return os.path.join(os.path.dirname(__file__), "auth_profiles.json")
+    def _load_profiles_file(self):
+        p=self._profiles_path()
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f: return json.load(f)
+            except Exception: return {}
+        return {}
+    def _write_profiles_file(self, data):
+        with open(self._profiles_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    def _save_profile(self):
+        url=self.url.get().strip()
+        if not url:
+            if messagebox: messagebox.showinfo("Profile", "URL fehlt."); 
+            return
+        data=self._load_profiles_file()
+        data[url]={"auth_mode": self.auth_mode.get(),"token": self.auth_token.get(),"header": self.auth_header.get()}
+        self._write_profiles_file(data); self._sink(f"Profile gespeichert für URL: {url}")
+    def _load_profile(self):
+        url=self.url.get().strip(); data=self._load_profiles_file()
+        if url not in data:
+            if messagebox: messagebox.showinfo("Profile", "Kein Profil für diese URL.")
+            return
+        prof=data[url]; self.auth_mode.set(prof.get("auth_mode","None")); self.auth_token.set(prof.get("token","")); self.auth_header.set(prof.get("header","Authorization")); self._apply_auth(); self._sink(f"Profile geladen für URL: {url}")
+    def _delete_profile(self):
+        url=self.url.get().strip(); data=self._load_profiles_file()
+        if url in data:
+            del data[url]; self._write_profiles_file(data); self._sink(f"Profile gelöscht für URL: {url}")
+        else:
+            if messagebox: messagebox.showinfo("Profile", "Kein Profil vorhanden.")
+
+    def _apply_auth(self):
+        mode=getattr(self, "auth_mode").get(); token=getattr(self, "auth_token").get().strip(); header=getattr(self, "auth_header").get().strip() or "Authorization"
+        extra={}
+        if mode=="Bearer":
+            if not token: self._sink("Auth: leeres Token.")
+            extra[header]="Bearer "+token
+        elif mode=="Custom header":
+            if not token: self._sink("Auth: leeres Token.")
+            extra[header]=token
+        else:
+            extra={}
+        self._auth_extra=extra
+        self._sink("Auth-Header gesetzt: " + ("; ".join([f'{k}: {("***" if v else "")}' for k,v in extra.items()]) or "none"))
+        self.client=None
+
+    def _build_client(self, reset=False, extra_override=None):
+        if reset or self.client is None:
+            mode = self.tls_mode.get()
+            verify=True
+            if mode=="Insecure (not recommended)":
+                verify=False
+            elif mode=="Embedded CA (./certs/ca.cert.pem)":
+                p=os.path.join(os.path.dirname(__file__),"certs","ca.cert.pem")
+                verify=p if os.path.exists(p) else True
+                if not os.path.exists(p):
+                    self._sink("WARN: ./certs/ca.cert.pem nicht gefunden. 'Generate CA+Server' ausführen oder TLS Mode wechseln.")
+            elif mode=="Pick file...":
+                p=self.ca.get().strip(); verify=p if p else True
+            url=self.url.get().strip()
+            try: to=float(self.timeout.get() or "30")
+            except: to=30.0
+            extra = extra_override if extra_override is not None else getattr(self, "_auth_extra", {})
+            if extra and mode=="Insecure (not recommended)":
+                self._sink("WARN: Bearer/API-Key niemals ohne TLS senden.")
+            if not verify:
+                try:
+                    from urllib3.exceptions import InsecureRequestWarning
+                    warnings.simplefilter("ignore", InsecureRequestWarning)
+                except Exception:
+                    pass
+            self.client = MCP(url, verify=verify, timeout=to, extra=extra, sink=Sink(self._sink, self.mem_log), verbose=False)
+        return self.client
+
+    def _run_selected(self):
+        sel=self.tree.selection()
+        if not sel: return
+        action=sel[0]
+        threading.Thread(target=lambda: self._run_action(action), daemon=True).start()
+
+    def _run_all(self):
+        for i in self.summary.get_children(): self.summary.delete(i)
+        c=self._build_client(reset=True)
+        try: ov_to=float(self.overall_timeout.get() or "30")
+        except: ov_to=30.0
+        def run():
+            try:
+                summary, details = c.overall(timeout_override=ov_to)
+            except Exception as e:
+                summary=[{"level":"MUST","check":"overall()", "status":"FAIL","detail":str(e)}]; details={}
+            self.last_report={"summary":summary,"details":details,"log":"\n".join(self.mem_log),"meta":{"url":self.url.get().strip(),"tls_mode":self.tls_mode.get(),"time":time.strftime("%Y-%m-%d %H:%M:%S"),"protocol_version":getattr(c,'proto',''),"session_id":getattr(c,'sid','')}}
+            self.root.after(0, self._populate_summary, summary)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _run_overall(self):
+        for i in self.summary.get_children(): self.summary.delete(i)
+        c=self._build_client(reset=False)
+        try: ov_to=float(self.overall_timeout.get() or "30")
+        except: ov_to=30.0
+        def run():
+            try:
+                summary, details = c.overall(timeout_override=ov_to)
+            except Exception as e:
+                summary=[{"level":"MUST","check":"overall()", "status":"FAIL","detail":str(e)}]; details={}
+            self.last_report={"summary":summary,"details":details,"log":"\n".join(self.mem_log),"meta":{"url":self.url.get().strip(),"tls_mode":self.tls_mode.get(),"time":time.strftime("%Y-%m-%d %H:%M:%S"),"protocol_version":getattr(c,'proto',''),"session_id":getattr(c,'sid','')}}
+            self.root.after(0, self._populate_summary, summary)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _populate_summary(self, summary):
+        for it in summary:
+            tag = "ok" if it["status"]=="OK" else ("warn" if it["status"] in ("WARN","INFO") else "err")
+            self.summary.insert("", "end", values=(it["check"], it["level"], it["status"], it.get("detail","")), tags=(tag,))
+
+    def _run_auth_tests(self):
+        self.summary.insert("", "end", values=("Auth tests", "", "", ""))
+        url=self.url.get().strip()
+        try: to=float(self.timeout.get() or "30")
+        except: to=30.0
+        mode = self.tls_mode.get()
+        verify=True
+        if mode=="Insecure (not recommended)": verify=False
+        elif mode=="Embedded CA (./certs/ca.cert.pem)":
+            p=os.path.join(os.path.dirname(__file__),"certs","ca.cert.pem"); verify=p if os.path.exists(p) else True
+        elif mode=="Pick file...":
+            p=self.ca.get().strip(); verify=p if p else True
+
+        def mk(extra):
+            return MCP(url, verify=verify, timeout=to, extra=extra, sink=Sink(self._sink, self.mem_log), verbose=False)
+
+        tests=[("No token", {}),("Invalid token", {"Authorization": "Bearer invalid-"+str(int(time.time()))}),("Provided token", getattr(self, "_auth_extra", {}))]
+        def run():
+            rows=[]
+            for name, extra in tests:
+                c = mk(extra)
+                try:
+                    obj, r = c.initialize()
+                    code=r.status_code
+                    if name=="No token" and code==401:
+                        wa=r.headers.get("WWW-Authenticate",""); status="OK" if wa else "WARN"; detail=f"401; WWW-Authenticate: {wa or 'missing'}"
+                    elif name=="Invalid token" and code in (401,403):
+                        status="OK"; detail=f"HTTP {code}"
+                    elif name=="Provided token" and 200 <= code < 300:
+                        status="OK"; detail=f"HTTP {code}"
+                    else:
+                        status="INFO"; detail=f"HTTP {code}"
+                except Exception as e:
+                    status="FAIL"; detail=str(e)
+                rows.append((f"Auth: {name}", "INFO", status, detail))
+            self.root.after(0, lambda: [self.summary.insert("", "end", values=row, tags=(("ok" if r[2]=="OK" else ("warn" if r[2] in ("INFO","WARN") else "err")),)) for r in rows])
+        threading.Thread(target=run, daemon=True).start()
+
+    def _stop_audit(self):
+        self._audit_stop=True
+        self._sink("Audit stop requested. Läuft bis zum Ende des aktuellen Requests weiter.")
+
+    def _run_audit(self):
+        for i in self.audit.get_children(): self.audit.delete(i)
+        self._audit_stop=False
+        c=self._build_client(reset=False)
+        if c.sid=="":
+            self._sink("Keine Session aktiv. Bitte zuerst 'POST initialize' ausführen."); return
+        try: per_to=float(self.audit_timeout.get() or "10")
+        except: per_to=10.0
+        try: parallel=int(self.audit_parallel.get() or "4")
+        except: parallel=4
+        self.audit_progress.set("")
+        def on_progress(res):
+            if res is None: return
+            def _ins(): 
+                tag=""
+                okset={"OK","ARGS_VALID","OUTPUT_VALID"}
+                errset={"ARGS_INVALID","HTTP_ERROR","PROTOCOL_ERROR","TOOL_ERROR","TIMEOUT","EXCEPTION","OUTPUT_SCHEMA_INVALID"}
+                if res["status"] in okset: tag="ok"
+                elif res["status"] in errset: tag="err"
+                self.audit.insert("", "end", values=(res["tool"], res["status"], f"{int(res.get('ms',0))}", f"{res.get('kb',0.0):.2f}", res.get("detail","")), tags=((tag,) if tag else ()))
+                cur=self.audit_progress.get() or "0 done"
+                try: cnt=int(cur.split()[0])+1
+                except: cnt=1
+                self.audit_progress.set(f"{cnt} done")
+            self.root.after(0, _ins)
+        def stop_flag(): return self._audit_stop
+        def run():
+            out = c.audit_tools(per_call_timeout=per_to, parallelism=max(1,parallel), stop_flag=stop_flag, on_progress=on_progress, validate_outputs=True)
+            if not hasattr(self, "last_report") or self.last_report is None:
+                self.last_report={"summary":[],"details":{},"log":"\n".join(self.mem_log),"meta":{"url":self.url.get().strip(),"tls_mode":self.tls_mode.get(),"time":time.strftime("%Y-%m-%d %H:%M:%S"),"protocol_version":c.proto,"session_id":c.sid}}
+            self.last_report["details"]["audit"]=out
+            self.root.after(0, lambda: self.audit_progress.set(f"Finished: {len(out)} tools processed"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _open_tree(self):
+        c=self._build_client(reset=False)
+        data = c.last_body if c and c.last_body is not None else {}
+        top=tk.Toplevel(self.root); top.title("Last JSON result")
+        tv=ttk.Treeview(top, columns=("value",), show="tree headings")
+        tv.heading("value", text="Value"); tv.pack(fill="both", expand=True)
+        def add_node(parent, key, val):
+            label=str(key)
+            if isinstance(val, dict):
+                nid=tv.insert(parent, "end", text=label, values=("",))
+                for k,v in val.items(): add_node(nid, k, v)
+            elif isinstance(val, list):
+                nid=tv.insert(parent, "end", text=f"{label} []", values=("",))
+                for i,v in enumerate(val): add_node(nid, i, v)
+            else:
+                tv.insert(parent, "end", text=label, values=(str(val),))
+        add_node("", "root", data)
+        for n in tv.get_children(): tv.item(n, open=True)
+
+    def _show_curl(self):
+        c=self._build_client(reset=False)
+        s_bash=c.last_curl(redact=True, windows=False) if c else ""
+        s_win=c.last_curl(redact=True, windows=True) if c else ""
+        top=tk.Toplevel(self.root); top.title("cURL (last request)")
+        txt=ScrolledText(top, height=20); txt.pack(fill="both", expand=True)
+        txt.insert("1.0", "# Bash\n"+s_bash+"\n\n# Windows CMD/PowerShell\n"+s_win); txt.see("1.0")
+
+    def _save_httpfile(self):
+        c=self._build_client(reset=False)
+        if not c or not c.last_http:
+            if messagebox: messagebox.showinfo("Save .http", "Kein letzter Request gefunden.")
+            return
+        h=c.last_http
+        p=filedialog.asksaveasfilename(defaultextension=".http", filetypes=[("HTTP file","*.http"),("Text","*.txt")], initialfile="last_request.http")
+        if not p: return
+        lines=[f"{h['method']} {h['url']}"]
+        for k,v in h.get("headers",{}).items():
+            if k.lower()=="authorization": v="***"
+            lines.append(f"{k}: {v}")
+        lines.append("")
+        if h.get("body") is not None:
+            lines.append(json.dumps(h["body"], indent=2, ensure_ascii=False))
+        with open(p, "w", encoding="utf-8") as f: f.write("\n".join(lines))
+        if messagebox: messagebox.showinfo("Save .http", f"Gespeichert: {p}")
+
+    def _save_report(self):
+        if not self.last_report:
+            c=self._build_client(reset=False)
+            snap={"summary":[],"details":{},"meta":{"url":self.url.get().strip(),"tls_mode":self.tls_mode.get(),"time":time.strftime("%Y-%m-%d %H:%M:%S"),"protocol_version":getattr(c,'proto',''),"session_id":getattr(c,'sid','')},"log":"\n".join(self.mem_log)}
+        else:
+            snap=self.last_report
+        default = f"mcp_report_{int(time.time())}.zip"
+        p=filedialog.asksaveasfilename(initialfile=default, defaultextension=".zip", filetypes=[("ZIP","*.zip")])
+        if not p: return
+        md_lines = [f"# MCP Overall Report", f"- URL: {snap['meta']['url']}", f"- Time: {snap['meta']['time']}", f"- TLS Mode: {snap['meta']['tls_mode']}", f"- Protocol Version: {snap['meta'].get('protocol_version','')}", f"- Session ID: {snap['meta'].get('session_id','')}", "", "## Summary", "| Level | Check | Status | Detail |", "|---|---|---|---|"]
+        for it in snap.get("summary", []):
+            md_lines.append(f"| {it.get('level','')} | {it.get('check','')} | {it.get('status','')} | {it.get('detail','')} |")
+        md = "\n".join(md_lines)
+        c=self._build_client(reset=False)
+        last_http = getattr(c, "last_http", None); last_http_text = ""
+        if last_http:
+            lines=[f"{last_http['method']} {last_http['url']}"]
+            for k,v in last_http.get("headers",{}).items():
+                if k.lower()=="authorization": v="***"
+                lines.append(f"{k}: {v}")
+            lines.append("")
+            if last_http.get("body") is not None:
+                lines.append(json.dumps(last_http["body"], indent=2, ensure_ascii=False))
+            last_http_text="\n".join(lines)
+        with zipfile.ZipFile(p, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("report.json", json.dumps(snap, ensure_ascii=False, indent=2))
+            z.writestr("report.md", md)
+            z.writestr("log.txt", snap.get("log",""))
+            if last_http_text: z.writestr("last_request.http", last_http_text)
+        if messagebox: messagebox.showinfo("Report", f"Gespeichert: {p}")
+
+    def _run_action(self, action):
+        c=self._build_client(reset=False)
+        try:
+            if action=="init":
+                c.initialize()
+            elif action=="initialized":
+                c.initialized()
+            elif action=="tools_list":
+                c.list_tools()
+            elif action=="resources_list":
+                c.list_resources()
+            elif action=="prompts_list":
+                c.list_prompts()
+            elif action=="prompts_get_first":
+                obj,_=c.list_prompts()
+                items=(obj.get("result") or {}).get("prompts") or []
+                if not items: self._sink("WARN: keine Prompts."); return
+                name=items[0].get("name"); c.call("prompts/get", {"name": name, "arguments": {}}, sse_max_seconds=10)
+            elif action=="resources_read_first":
+                obj,_=c.list_resources()
+                items=(obj.get("result") or {}).get("resources") or []
+                if not items: self._sink("WARN: keine Resources."); return
+                uri=items[0].get("uri"); c.call("resources/read", {"uris": [uri]}, sse_max_seconds=10)
+            elif action=="tools_call_first":
+                obj,_=c.list_tools()
+                items=(obj.get("result") or {}).get("tools") or []
+                if not items: self._sink("WARN: keine Tools."); return
+                name=items[0].get("name"); c.call("tools/call", {"name": name, "arguments": {}}, sse_max_seconds=15)
+            elif action=="audit_tools":
+                self._run_audit()
+            elif action=="get_sse":
+                c.get_sse(3)
+            elif action=="delete_session":
+                c.delete_session()
+        except Exception as e:
+            self._sink(f"Aktion {action} Fehler: {e}")
+
+# --------------- CLI ---------------
+def run_cli(args):
+    sink=Sink()
+    verify=True
+    if args.insecure: verify=False
+    elif args.ca: verify=args.ca
+    extra={}
+    if args.bearer:
+        extra[args.header if args.header else "Authorization"] = "Bearer " + args.bearer
+    elif args.api_key and args.header:
+        extra[args.header]=args.api_key
+    if verify is False:
+        try:
+            from urllib3.exceptions import InsecureRequestWarning
+            warnings.simplefilter("ignore", InsecureRequestWarning)
+        except Exception:
+            pass
+    c=MCP(args.url, verify=verify, timeout=args.timeout, extra=extra, sink=sink, verbose=args.verbose)
+    if args.mode=="overall":
+        summary, details = c.overall(timeout_override=args.timeout)
+        out={"summary":summary,"details":details,"meta":{"url":args.url,"time":time.strftime("%Y-%m-%d %H:%M:%S"),"protocol_version":c.proto,"session_id":c.sid}}
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, indent=2)
+        else:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        return
+    if args.mode=="audit":
+        c.initialize(); c.initialized()
+        out = c.audit_tools(limit=args.limit, per_call_timeout=args.per_timeout, parallelism=max(1,args.parallel), validate_outputs=True)
+        print(json.dumps(out, ensure_ascii=False, indent=2)); return
+    c.initialize(); c.initialized()
+    if args.lists:
+        c.list_tools(); c.list_resources(); c.list_prompts()
+    if args.sse_seconds>0:
+        c.get_sse(args.sse_seconds)
+
+def main():
+    ap=argparse.ArgumentParser(description="MCP Diagnoser v4.2")
+    sub=ap.add_subparsers(dest="mode")
+    p=sub.add_parser("diagnose")
+    p.add_argument("--url", required=True)
+    p.add_argument("--timeout", type=float, default=30.0)
+    p.add_argument("--insecure", action="store_true")
+    p.add_argument("--ca", default=None)
+    p.add_argument("--lists", action="store_true")
+    p.add_argument("--sse-seconds", type=int, default=0)
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--bearer", default=None)
+    p.add_argument("--api-key", default=None)
+    p.add_argument("--header", default=None)
+
+    pov=sub.add_parser("overall")
+    pov.add_argument("--url", required=True)
+    pov.add_argument("--timeout", type=float, default=30.0)  # also acts as overall timeout
+    pov.add_argument("--insecure", action="store_true")
+    pov.add_argument("--ca", default=None)
+    pov.add_argument("--out", default=None)
+    pov.add_argument("--verbose", action="store_true")
+    pov.add_argument("--bearer", default=None)
+    pov.add_argument("--api-key", default=None)
+    pov.add_argument("--header", default=None)
+
+    pa=sub.add_parser("audit")
+    pa.add_argument("--url", required=True)
+    pa.add_argument("--timeout", type=float, default=30.0)
+    pa.add_argument("--insecure", action="store_true")
+    pa.add_argument("--ca", default=None)
+    pa.add_argument("--limit", type=int, default=None)
+    pa.add_argument("--per-timeout", type=float, default=10.0, dest="per_timeout")
+    pa.add_argument("--parallel", type=int, default=4)
+    pa.add_argument("--verbose", action="store_true")
+    pa.add_argument("--bearer", default=None)
+    pa.add_argument("--api-key", default=None)
+    pa.add_argument("--header", default=None)
+
+    args=ap.parse_args()
+    if args.mode in ("diagnose","overall","audit"):
+        run_cli(args); return
+    if tk is None:
+        print("Tkinter nicht verfuegbar. CLI verwenden.", file=sys.stderr); sys.exit(2)
+    root=tk.Tk(); ProGUI(root); root.mainloop()
+
+if __name__=="__main__":
+    main()
