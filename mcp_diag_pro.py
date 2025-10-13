@@ -24,10 +24,13 @@ class Sink:
     def __init__(self, gui_cb=None, mem_log=None):
         self.gui_cb=gui_cb
         self.mem_log = mem_log if mem_log is not None else []
+        self.session_resets = 0
     def write(self, line):
         msg = f"[{ts()}] {line}"
         print(msg, flush=True)
         self.mem_log.append(msg)
+        if "Session-Objekt zurückgesetzt" in line or "Session-Objekt zur\u00fcckgesetzt" in line:
+            self.session_resets += 1
         if self.gui_cb: self.gui_cb(msg)
 
 class MCP:
@@ -53,7 +56,11 @@ class MCP:
             i=self._id; self._id+=1; return i
 
     def _h_post(self, include_sid=True, include_proto=True, is_init=False, accept_json_only=False):
-        accept = "application/json" if accept_json_only else "application/json, text/event-stream"
+        if accept_json_only:
+            # prefer JSON responses but still allow servers that insist on text/event-stream
+            accept = "application/json, text/event-stream;q=0.5"
+        else:
+            accept = "application/json, text/event-stream"
         h={"Accept": accept, "Content-Type":"application/json"}
         if include_sid and self.sid: h["Mcp-Session-Id"]=self.sid
         if include_proto and self.proto and not is_init: h["MCP-Protocol-Version"]=self.proto
@@ -354,6 +361,113 @@ class MCP:
             pass
         return 0
 
+    def _gather_text_blocks(self, tool_result):
+        texts=[]
+        def _add(val):
+            if isinstance(val, str):
+                s=val.strip()
+                if s:
+                    texts.append(s)
+        if isinstance(tool_result, dict):
+            for key in ("summary","message","text","detail"):
+                _add(tool_result.get(key))
+            content=tool_result.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        _add(item.get("text"))
+        return texts
+
+    def _walk_json_nodes(self, obj, collected=None):
+        if collected is None:
+            collected=[]
+        if isinstance(obj, dict):
+            collected.append(obj)
+            for value in obj.values():
+                self._walk_json_nodes(value, collected)
+        elif isinstance(obj, list):
+            for value in obj:
+                self._walk_json_nodes(value, collected)
+        return collected
+
+    def _parse_text_blocks(self, texts):
+        parsed=[]
+        for txt in texts:
+            stripped=txt.strip()
+            if not stripped or stripped[0] not in "{[":
+                continue
+            try:
+                parsed.append(json.loads(stripped))
+            except Exception:
+                continue
+        return parsed
+
+    def _analyze_result_messages(self, tool_name, tool_result):
+        if not isinstance(tool_result, dict):
+            return None, ""
+        texts=self._gather_text_blocks(tool_result)
+        parsed=self._parse_text_blocks(texts)
+        structured=tool_result.get("structuredContent")
+        if structured is not None:
+            parsed.append(structured)
+        nodes=[]
+        for block in parsed:
+            nodes.extend(self._walk_json_nodes(block, []))
+        issues=[]
+
+        def add_issue(code, message):
+            if not isinstance(message, str):
+                return
+            cleaned=message.strip()
+            if cleaned:
+                issues.append((code, cleaned))
+
+        for txt in texts:
+            low=txt.lower()
+            if "not implemented" in low:
+                add_issue("NOT_IMPLEMENTED", txt)
+            if "blocked" in low or "unable to rotate" in low:
+                add_issue("LOGICAL_BLOCKED", txt)
+            if "action_needed" in low or "action needed" in low or "wake it up" in low:
+                add_issue("ACTION_REQUIRED", txt)
+            if "power_error" in low or "device still authorizing" in low or "adb.exe" in low or "not found" in low:
+                add_issue("DEVICE_ERROR", txt)
+            if "screen state unclear" in low:
+                add_issue("SCREEN_STATE_UNCLEAR", txt)
+
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            p_err=node.get("power_error")
+            if isinstance(p_err, str) and p_err.strip():
+                add_issue("DEVICE_ERROR", f"power_error: {p_err.strip()}")
+            w_err=node.get("window_error")
+            if isinstance(w_err, str) and w_err.strip():
+                add_issue("DEVICE_ERROR", f"window_error: {w_err.strip()}")
+            action=node.get("action_needed")
+            if isinstance(action, str) and action.strip():
+                add_issue("ACTION_REQUIRED", f"action_needed: {action.strip()}")
+            summary=node.get("summary")
+            if isinstance(summary, str) and "screen state unclear" in summary.lower():
+                add_issue("SCREEN_STATE_UNCLEAR", summary)
+
+        if not issues:
+            return None, ""
+
+        priority={"DEVICE_ERROR":5,"LOGICAL_BLOCKED":3,"ACTION_REQUIRED":3,"SCREEN_STATE_UNCLEAR":2,"NOT_IMPLEMENTED":1}
+        status_map={
+            "DEVICE_ERROR":"DEVICE_ERROR",
+            "LOGICAL_BLOCKED":"WARN_BLOCKED",
+            "ACTION_REQUIRED":"WARN_ACTION_REQUIRED",
+            "SCREEN_STATE_UNCLEAR":"WARN_STATE_UNCLEAR",
+            "NOT_IMPLEMENTED":"WARN_NOT_IMPLEMENTED"
+        }
+        issues.sort(key=lambda item: priority.get(item[0],0), reverse=True)
+        top_code=issues[0][0]
+        status=status_map.get(top_code)
+        detail="; ".join(dict.fromkeys([msg for _, msg in issues]))
+        return status, detail
+
     def audit_tools(self, limit=None, per_call_timeout=None, parallelism=1, stop_flag=None, on_progress=None, validate_outputs=True):
         tools_obj, _ = self.list_tools()
         tools = (tools_obj.get("result") or {}).get("tools") or []
@@ -361,71 +475,101 @@ class MCP:
 
         results = []
 
+        if on_progress:
+            try:
+                on_progress({"meta":"start","total":len(tools)})
+            except Exception:
+                pass
+
         def worker(t):
             if stop_flag and stop_flag(): 
                 return None
-            name = t.get("name","")
-            schema = t.get("inputSchema") or {}
-            out_schema = t.get("outputSchema") or None
-            args = self._gen_from_schema(schema)
-            ok, err = self._validate(schema, args)
-            status = "ARGS_VALID" if ok else "ARGS_INVALID"
-            detail = "" if ok else err or "Validation failed"
-            ms = 0
-            kb = 0.0
-            tokens = 0
-            if not ok:
-                res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":None}
-                if on_progress: on_progress(res)
-                return res
+            notified=False
             try:
-                start=time.monotonic()
-                obj, resp = self.call("tools/call", {"name": name, "arguments": args}, sse_max_seconds=20)
-                ms = int(round((time.monotonic()-start)*1000))
-                tokens = self._estimate_tokens(obj)
+                if on_progress:
+                    on_progress({"meta":"inflight","delta":1})
+                    notified=True
+                name = t.get("name","")
+                schema = t.get("inputSchema") or {}
+                out_schema = t.get("outputSchema") or None
+                args = self._gen_from_schema(schema)
+                ok, err = self._validate(schema, args)
+                status = "ARGS_VALID" if ok else "ARGS_INVALID"
+                detail = "" if ok else err or "Validation failed"
+                ms = 0
+                kb = 0.0
+                tokens = 0
+                if not ok:
+                    res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":None}
+                    if on_progress: on_progress(res)
+                    return res
                 try:
-                    ct=(resp.headers.get("Content-Type") or "").lower()
-                except Exception:
-                    ct=""
-                try:
-                    if "application/json" in ct:
-                        kb = (len(resp.content or b"")/1024.0)
-                    else:
-                        kb = (len(json.dumps(obj).encode("utf-8"))/1024.0)
-                except Exception:
-                    kb = 0.0
-
-                if resp.ok:
-                    out_status=None; out_detail=None
-                    if isinstance(obj, dict) and "error" in obj:
-                        status="PROTOCOL_ERROR"; detail=f"{obj['error'].get('code')} {obj['error'].get('message')}"
-                    else:
-                        rres = (obj.get("result") or {}) if isinstance(obj, dict) else {}
-                        if isinstance(rres, dict) and rres.get("isError"):
-                            status="TOOL_ERROR"; detail="isError=true"
+                    start=time.monotonic()
+                    obj, resp = self.call("tools/call", {"name": name, "arguments": args}, sse_max_seconds=20)
+                    ms = int(round((time.monotonic()-start)*1000))
+                    tokens = self._estimate_tokens(obj)
+                    try:
+                        ct=(resp.headers.get("Content-Type") or "").lower()
+                    except Exception:
+                        ct=""
+                    try:
+                        if "application/json" in ct:
+                            kb = (len(resp.content or b"")/1024.0)
                         else:
-                            status="OK"; detail="call succeeded"
-                            if validate_outputs and out_schema:
-                                structured = self._extract_structured_from_result(rres)
-                                if structured is None:
-                                    out_status="NO_STRUCTURED"; out_detail="no structuredContent / parsable JSON text"
-                                else:
-                                    v_ok, v_err = self._validate(out_schema, structured)
-                                    if v_ok: out_status="OUTPUT_VALID"; out_detail=""
-                                    else: out_status="OUTPUT_SCHEMA_INVALID"; out_detail=v_err or "schema validation failed"
-                    if out_status:
-                        detail = (detail + ("; " if detail else "") + f"{out_status}: {out_detail}").strip("; ")
+                            kb = (len(json.dumps(obj).encode("utf-8"))/1024.0)
+                    except Exception:
+                        kb = 0.0
+
+                    if resp.ok:
+                        out_status=None; out_detail=None
+                        if isinstance(obj, dict) and "error" in obj:
+                            status="PROTOCOL_ERROR"; detail=f"{obj['error'].get('code')} {obj['error'].get('message')}"
+                        else:
+                            rres = (obj.get("result") or {}) if isinstance(obj, dict) else {}
+                            if isinstance(rres, dict) and rres.get("isError"):
+                                status="TOOL_ERROR"; detail="isError=true"
+                            else:
+                                status="OK"; detail="call succeeded"
+                                if validate_outputs and out_schema:
+                                    structured = self._extract_structured_from_result(rres)
+                                    if structured is None:
+                                        out_status="NO_STRUCTURED"; out_detail="no structuredContent / parsable JSON text"
+                                    else:
+                                        v_ok, v_err = self._validate(out_schema, structured)
+                                        if v_ok: out_status="OUTPUT_VALID"; out_detail=""
+                                        else: out_status="OUTPUT_SCHEMA_INVALID"; out_detail=v_err or "schema validation failed"
+                                # semantic analysis even when validation succeeded
+                                if isinstance(rres, dict):
+                                    sem_status, sem_detail = self._analyze_result_messages(name, rres)
+                                    if sem_status:
+                                        if status == "OK":
+                                            status = sem_status
+                                            if sem_detail:
+                                                detail = sem_detail
+                                            elif not detail:
+                                                detail = sem_status
+                                        else:
+                                            if sem_detail:
+                                                detail = (detail + ("; " if detail else "") + sem_detail).strip("; ")
+                        if out_status:
+                            detail = (detail + ("; " if detail else "") + f"{out_status}: {out_detail}").strip("; ")
                     else:
                         status="HTTP_ERROR"; detail=f"HTTP {resp.status_code}"
-                res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":resp.status_code}
-            except requests.exceptions.Timeout as e:
-                ms = int(round((time.monotonic()-start)*1000))
-                res={"tool":name,"status":"TIMEOUT","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None}
-            except Exception as e:
-                ms = int(round((time.monotonic()-start)*1000))
-                res={"tool":name,"status":"EXCEPTION","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None}
-            if on_progress: on_progress(res)
-            return res
+                    res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":resp.status_code}
+                except requests.exceptions.Timeout as e:
+                    ms = int(round((time.monotonic()-start)*1000))
+                    res={"tool":name,"status":"TIMEOUT","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None}
+                except Exception as e:
+                    ms = int(round((time.monotonic()-start)*1000))
+                    res={"tool":name,"status":"EXCEPTION","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None}
+                if on_progress: on_progress(res)
+                return res
+            finally:
+                if notified:
+                    try:
+                        on_progress({"meta":"inflight","delta":-1})
+                    except Exception:
+                        pass
 
         if parallelism<=1:
             for t in tools:
@@ -497,14 +641,34 @@ class MCP:
             # Robust error-object probe: try unknown method JSON-only; fallback to invalid params
             try:
                 bad, br = self.call("rpc/does_not_exist", {}, stream=False, accept_json_only=True)
-                err_ok = isinstance(bad, dict) and isinstance(bad.get("error"), dict) and ("code" in bad["error"] and "message" in bad["error"])
+                primary_status = getattr(br, "status_code", "n/a")
+                err_payload_ok = isinstance(bad, dict) and isinstance(bad.get("error"), dict) and ("code" in bad["error"] and "message" in bad["error"])
+                err_ok = bool(getattr(br, "ok", False)) and err_payload_ok
+                detail_parts = [f"primary HTTP {primary_status}"]
+                if isinstance(bad, (dict, list)):
+                    try:
+                        detail_parts.append(json.dumps(bad, ensure_ascii=False)[:200])
+                    except Exception:
+                        detail_parts.append(str(bad)[:200])
+                elif bad is not None:
+                    detail_parts.append(str(bad)[:200])
+                fallback_note = ""
                 if not err_ok:
                     # fallback: provoke invalid params on tools/call
                     bad2, br2 = self.call("tools/call", {"arguments": {"_":1}}, stream=False, accept_json_only=True)
-                    err_ok = isinstance(bad2, dict) and isinstance(bad2.get("error"), dict) and ("code" in bad2["error"] and "message" in bad2["error"])
-                    add("MUST","JSON-RPC error format", "OK" if err_ok else "FAIL", json.dumps(bad2 if err_ok else bad)[:200])
-                else:
-                    add("MUST","JSON-RPC error format", "OK", json.dumps(bad)[:200])
+                    fb_status = getattr(br2, "status_code", "n/a")
+                    fb_payload_ok = isinstance(bad2, dict) and isinstance(bad2.get("error"), dict) and ("code" in bad2["error"] and "message" in bad2["error"])
+                    if isinstance(bad2, (dict, list)):
+                        try:
+                            fb_preview = json.dumps(bad2, ensure_ascii=False)[:200]
+                        except Exception:
+                            fb_preview = str(bad2)[:200]
+                    else:
+                        fb_preview = str(bad2)[:200]
+                    fallback_note = f"fallback HTTP {fb_status} ({'valid error' if fb_payload_ok else 'invalid error'}) {fb_preview}"
+                    detail_parts.append(fallback_note)
+                detail = "; ".join([p for p in detail_parts if p])
+                add("MUST","JSON-RPC error format", "OK" if err_ok else "FAIL", detail)
             except Exception as e:
                 add("MUST","JSON-RPC error format", "WARN", f"probe failed: {e}")
 
@@ -543,6 +707,13 @@ class MCP:
             except Exception as e:
                 add("OPTIONAL","DELETE session", "WARN", str(e))
 
+            try:
+                resets=getattr(self.sink, "session_resets", 0)
+                if resets and resets > 1:
+                    add("INFO","Session resets", "WARN", f"{resets} resets observed during run")
+            except Exception:
+                pass
+
         return summary, details
 
 # ---------------- GUI ----------------
@@ -552,6 +723,9 @@ class ProGUI:
         self.mem_log=[]
         self.q=queue.Queue(); self.client=None; self.last_report=None
         self._audit_stop=False
+        self._audit_total=0
+        self._audit_done=0
+        self._audit_running=0
 
         # Shared Tk variables used across wizard and main controls
         self.url=tk.StringVar(value="https://localhost:5000/mcp")
@@ -901,9 +1075,16 @@ class ProGUI:
         threading.Thread(target=run, daemon=True).start()
 
     def _populate_summary(self, summary):
+        warn_statuses={"WARN","INFO","WARN_BLOCKED","WARN_ACTION_REQUIRED","WARN_STATE_UNCLEAR","WARN_NOT_IMPLEMENTED"}
         for it in summary:
-            tag = "ok" if it["status"]=="OK" else ("warn" if it["status"] in ("WARN","INFO") else "err")
-            self.summary.insert("", "end", values=(it["check"], it["level"], it["status"], it.get("detail","")), tags=(tag,))
+            status=it.get("status","")
+            if status=="OK":
+                tag="ok"
+            elif status in warn_statuses:
+                tag="warn"
+            else:
+                tag="err"
+            self.summary.insert("", "end", values=(it["check"], it["level"], status, it.get("detail","")), tags=(tag,))
 
     def _run_auth_tests(self):
         self.summary.insert("", "end", values=("Auth tests", "", "", ""))
@@ -940,12 +1121,27 @@ class ProGUI:
                 except Exception as e:
                     status="FAIL"; detail=str(e)
                 rows.append((f"Auth: {name}", "INFO", status, detail))
-            self.root.after(0, lambda: [self.summary.insert("", "end", values=row, tags=(("ok" if r[2]=="OK" else ("warn" if r[2] in ("INFO","WARN") else "err")),)) for r in rows])
+            warn_statuses={"WARN","INFO","WARN_BLOCKED","WARN_ACTION_REQUIRED","WARN_STATE_UNCLEAR","WARN_NOT_IMPLEMENTED"}
+            def _tag_for_status(status):
+                if status=="OK":
+                    return "ok"
+                if status in warn_statuses:
+                    return "warn"
+                return "err"
+            def _populate_rows():
+                for row in rows:
+                    tag=_tag_for_status(row[2])
+                    self.summary.insert("", "end", values=row, tags=(tag,))
+            self.root.after(0, _populate_rows)
         threading.Thread(target=run, daemon=True).start()
 
     def _stop_audit(self):
         self._audit_stop=True
         self._sink("Audit stop requested. Läuft bis zum Ende des aktuellen Requests weiter.")
+        if self._audit_running:
+            self.audit_progress.set(f"Stop requested · {self._audit_running} running")
+        else:
+            self.audit_progress.set("Stop requested")
 
     def _run_audit(self):
         for i in self.audit.get_children(): self.audit.delete(i)
@@ -958,22 +1154,60 @@ class ProGUI:
         try: parallel=int(self.audit_parallel.get() or "4")
         except: parallel=4
         self.audit_progress.set("")
-        def on_progress(res):
-            if res is None: return
+        self._audit_total=0
+        self._audit_done=0
+        self._audit_running=0
+
+        def _update_audit_status():
+            total=self._audit_total
+            running=self._audit_running
+            done=self._audit_done
+            parts=[]
+            if total:
+                parts.append(f"{done}/{total} done")
+            elif done:
+                parts.append(f"{done} done")
+            if running:
+                parts.append(f"{running} running")
+            self.audit_progress.set(" · ".join(parts) if parts else "")
+
+        def on_progress(event):
+            if event is None: 
+                return
             def _ins(): 
+                meta = event.get("meta") if isinstance(event, dict) else None
+                if meta == "start":
+                    try:
+                        self._audit_total = max(0, int(event.get("total") or 0))
+                    except Exception:
+                        self._audit_total = 0
+                    self._audit_done = 0
+                    self._audit_running = 0
+                    _update_audit_status()
+                    return
+                if meta == "inflight":
+                    try:
+                        delta=int(event.get("delta") or 0)
+                    except Exception:
+                        delta=0
+                    self._audit_running = max(0, self._audit_running + delta)
+                    _update_audit_status()
+                    return
+                res=event
                 tag=""
                 okset={"OK","ARGS_VALID","OUTPUT_VALID"}
-                errset={"ARGS_INVALID","HTTP_ERROR","PROTOCOL_ERROR","TOOL_ERROR","TIMEOUT","EXCEPTION","OUTPUT_SCHEMA_INVALID"}
-                if res["status"] in okset: tag="ok"
-                elif res["status"] in errset: tag="err"
+                warnset={"WARN","INFO","WARN_BLOCKED","WARN_ACTION_REQUIRED","WARN_STATE_UNCLEAR","WARN_NOT_IMPLEMENTED"}
+                errset={"ARGS_INVALID","HTTP_ERROR","PROTOCOL_ERROR","TOOL_ERROR","TIMEOUT","EXCEPTION","OUTPUT_SCHEMA_INVALID","DEVICE_ERROR"}
+                status=res.get("status","")
+                if status in okset: tag="ok"
+                elif status in warnset: tag="warn"
+                elif status in errset: tag="err"
                 tokens_val=res.get("tokens",0)
                 try: tokens_str=str(int(tokens_val))
                 except Exception: tokens_str=str(tokens_val)
-                self.audit.insert("", "end", values=(res["tool"], res["status"], f"{int(res.get('ms',0))}", tokens_str, f"{res.get('kb',0.0):.2f}", res.get("detail","")), tags=((tag,) if tag else ()))
-                cur=self.audit_progress.get() or "0 done"
-                try: cnt=int(cur.split()[0])+1
-                except: cnt=1
-                self.audit_progress.set(f"{cnt} done")
+                self.audit.insert("", "end", values=(res.get("tool","?"), status, f"{int(res.get('ms',0))}", tokens_str, f"{res.get('kb',0.0):.2f}", res.get("detail","")), tags=((tag,) if tag else ()))
+                self._audit_done += 1
+                _update_audit_status()
             self.root.after(0, _ins)
         def stop_flag(): return self._audit_stop
         def run():
@@ -981,7 +1215,16 @@ class ProGUI:
             if not hasattr(self, "last_report") or self.last_report is None:
                 self.last_report={"summary":[],"details":{},"log":"\n".join(self.mem_log),"meta":{"url":self.url.get().strip(),"tls_mode":self.tls_mode.get(),"time":time.strftime("%Y-%m-%d %H:%M:%S"),"protocol_version":c.proto,"session_id":c.sid}}
             self.last_report["details"]["audit"]=out
-            self.root.after(0, lambda: self.audit_progress.set(f"Finished: {len(out)} tools processed"))
+            def _finalize():
+                total = self._audit_total or len(out)
+                self._audit_total = total
+                self._audit_done = len(out)
+                self._audit_running = 0
+                if total:
+                    self.audit_progress.set(f"{self._audit_done}/{total} done · Finished")
+                else:
+                    self.audit_progress.set(f"Finished: {len(out)} tools processed")
+            self.root.after(0, _finalize)
         threading.Thread(target=run, daemon=True).start()
 
     def _open_tree(self):
