@@ -483,7 +483,21 @@ class ProGUI:
         self.mem_log=[]
         self.q=queue.Queue(); self.client=None; self.last_report=None
         self._audit_stop=False
+
+        # Shared Tk variables used across wizard and main controls
+        self.url=tk.StringVar(value="https://localhost:5000/mcp")
+        self.tls_mode=tk.StringVar(value="System Trust")
+        self.timeout=tk.StringVar(value="30")
+        self.overall_timeout=tk.StringVar(value="30")
+        self.ca=tk.StringVar(value="")
+        self.auth_mode=tk.StringVar(value="None")
+        self.auth_token=tk.StringVar(value="")
+        self.auth_header=tk.StringVar(value="Authorization")
+
+        self._wizard_active=False
         self._build(); self._pump()
+        if self.root is not None:
+            self.root.after(200, self._show_wizard)
 
     def _sink(self, m):
         self.mem_log.append(m)
@@ -501,40 +515,32 @@ class ProGUI:
         p={"padx":6,"pady":4}
         top=ttk.Frame(self.root); top.pack(fill="x", **p)
         ttk.Label(top, text="MCP URL:").grid(row=0, column=0, sticky="w")
-        self.url=tk.StringVar(value="https://localhost:5000/mcp")
         ttk.Entry(top, textvariable=self.url, width=50).grid(row=0, column=1, columnspan=2, sticky="we")
 
         ttk.Label(top, text="TLS Mode:").grid(row=0, column=3, sticky="e")
-        self.tls_mode=tk.StringVar(value="System Trust")
         tls=ttk.Combobox(top, textvariable=self.tls_mode, state="readonly",
                          values=["System Trust","Insecure (not recommended)","Embedded CA (./certs/ca.cert.pem)","Pick file..."], width=28)
         tls.grid(row=0, column=4, sticky="we")
 
         ttk.Label(top, text="Timeout (s):").grid(row=0, column=5, sticky="e")
-        self.timeout=tk.StringVar(value="30")
         ttk.Entry(top, textvariable=self.timeout, width=6).grid(row=0, column=6, sticky="w")
 
         ttk.Label(top, text="Overall timeout (s):").grid(row=0, column=7, sticky="e")
-        self.overall_timeout=tk.StringVar(value="30")
         ttk.Entry(top, textvariable=self.overall_timeout, width=6).grid(row=0, column=8, sticky="w")
 
         ttk.Label(top, text="CA-Bundle:").grid(row=1, column=0, sticky="w")
-        self.ca=tk.StringVar(value="")
         ttk.Entry(top, textvariable=self.ca, width=50).grid(row=1, column=1, columnspan=2, sticky="we")
         ttk.Button(top, text="…", width=3, command=self._pick_ca).grid(row=1, column=3, sticky="w")
         ttk.Button(top, text="Generate CA+Server", command=self._gen_ca).grid(row=1, column=4, sticky="w")
         ttk.Button(top, text="Clear console", command=self._clear).grid(row=1, column=5, sticky="w")
 
         ttk.Label(top, text="Auth:").grid(row=2, column=0, sticky="e")
-        self.auth_mode=tk.StringVar(value="None")
         self.auth_combo=ttk.Combobox(top, textvariable=self.auth_mode, state="readonly", values=["None","Bearer","Custom header"], width=14)
         self.auth_combo.grid(row=2, column=1, sticky="w")
         ttk.Label(top, text="Token:").grid(row=2, column=2, sticky="e")
-        self.auth_token=tk.StringVar(value="")
         self.auth_entry=ttk.Entry(top, textvariable=self.auth_token, show="*", width=28)
         self.auth_entry.grid(row=2, column=3, sticky="we")
         ttk.Label(top, text="Header-Name:").grid(row=2, column=4, sticky="e")
-        self.auth_header=tk.StringVar(value="Authorization")
         self.auth_header_entry=ttk.Entry(top, textvariable=self.auth_header, width=18)
         self.auth_header_entry.grid(row=2, column=5, sticky="w")
         ttk.Button(top, text="Apply auth", command=self._apply_auth).grid(row=2, column=6, sticky="w")
@@ -640,6 +646,27 @@ class ProGUI:
         tip = ttk.Label(self.root, text="Hinweis: Overall timeout gilt nur für den Gesamtcheck. Bearer nur via TLS.", foreground="#444")
         tip.pack(fill="x", **p)
 
+    def _show_wizard(self):
+        if self._wizard_active or tk is None:
+            return
+        self._wizard_active=True
+        try:
+            self.root.attributes("-disabled", True)
+        except Exception:
+            pass
+        SetupWizard(self)
+
+    def _wizard_closed(self):
+        try:
+            self.root.attributes("-disabled", False)
+        except Exception:
+            pass
+        self._wizard_active=False
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+
     def _prefill_payload(self):
         pl={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":DEFAULT_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"mcp-diagnoser-pro","version":"0.4.2"}}}
         self.payload.delete("1.0","end"); self.payload.insert("1.0", json.dumps(pl, indent=2))
@@ -669,6 +696,9 @@ class ProGUI:
                 f.write(server_cert.public_bytes(serialization.Encoding.PEM))
             with open(os.path.join(out,"ca_thumbprint.txt"),"w",encoding="utf-8") as f:
                 f.write(sha1_thumbprint(ca_cert))
+            ca_path = os.path.join(out, "ca.cert.pem")
+            self.ca.set(ca_path)
+            self.tls_mode.set("Embedded CA (./certs/ca.cert.pem)")
             self._sink("CA + Server-Zertifikat unter ./certs erzeugt.")
         except Exception as e:
             self._sink(f"Zertifikatsfehler: {e}")
@@ -975,6 +1005,221 @@ class ProGUI:
                 c.delete_session()
         except Exception as e:
             self._sink(f"Aktion {action} Fehler: {e}")
+
+# --------------- First-run wizard ---------------
+class SetupWizard(tk.Toplevel):
+    def __init__(self, gui: ProGUI):
+        super().__init__(gui.root)
+        self.gui = gui
+        self.title("MCP Debugger Setup Wizard")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._finish)
+
+        self.cert_choice = tk.StringVar(value="generate")
+        self.cert_choice.trace_add("write", self._update_cert_controls)
+        self.custom_ca = tk.StringVar(value=self.gui.ca.get())
+        self.tls_choice = tk.StringVar(value=self.gui.tls_mode.get())
+        self.tls_choice.trace_add("write", self._update_tls_controls)
+        self.url_choice = tk.StringVar(value=self.gui.url.get())
+
+        self.steps = [
+            ("Safety Warning", self._step_warning),
+            ("Certificates", self._step_certificates),
+            ("TLS Verification", self._step_tls_mode),
+            ("Target MCP Server", self._step_server),
+            ("Summary", self._step_summary),
+        ]
+        self.step_index = 0
+
+        container = ttk.Frame(self, padding=10)
+        container.pack(fill="both", expand=True)
+
+        self.header = ttk.Label(container, text="", font=("Segoe UI", 12, "bold"))
+        self.header.pack(anchor="w", pady=(0,6))
+
+        self.body = ttk.Frame(container)
+        self.body.pack(fill="both", expand=True)
+
+        nav = ttk.Frame(container)
+        nav.pack(fill="x", pady=(12,0))
+        self.back_btn = ttk.Button(nav, text="Back", command=self._back)
+        self.back_btn.pack(side="left")
+        ttk.Button(nav, text="Cancel", command=self._finish).pack(side="left", padx=(8,0))
+        self.next_btn = ttk.Button(nav, text="Next", command=self._next)
+        self.next_btn.pack(side="right")
+
+        self.bind("<Return>", lambda *_: self._next())
+        self.bind("<Escape>", lambda *_: self._finish())
+
+        self._render_step()
+        self.grab_set()
+        try:
+            self.focus_force()
+        except Exception:
+            pass
+
+    # ----- step renderers -----
+    def _render_step(self):
+        for child in self.body.winfo_children():
+            child.destroy()
+        title, builder = self.steps[self.step_index]
+        self.header.config(text=f"Step {self.step_index+1} of {len(self.steps)} · {title}")
+        builder(self.body)
+        self.back_btn.config(state="normal" if self.step_index > 0 else "disabled")
+        self.next_btn.config(text="Finish" if self.step_index == len(self.steps)-1 else "Next")
+        self._update_cert_controls()
+        self._update_tls_controls()
+
+    def _step_warning(self, frame):
+        ttk.Label(frame, text="⚠️  Run audit executes every available tool against the selected MCP server.\n"
+                              "Use this only in an isolated test environment. Never target production systems.",
+                  justify="left", wraplength=420).pack(anchor="w")
+        ttk.Label(frame, text="Read the README for full guidance before proceeding.",
+                  justify="left", wraplength=420, foreground="#444").pack(anchor="w", pady=(12,0))
+
+    def _step_certificates(self, frame):
+        ttk.Label(frame, text="Certificates", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Radiobutton(frame, text="Generate new localhost certificate bundle now",
+                        variable=self.cert_choice, value="generate").pack(anchor="w", pady=(6,0))
+        ttk.Radiobutton(frame, text="Use existing certificates",
+                        variable=self.cert_choice, value="existing").pack(anchor="w")
+        ca_box = ttk.Frame(frame)
+        ca_box.pack(fill="x", pady=(8,0))
+        ttk.Label(ca_box, text="CA file:").pack(side="left")
+        self._cert_entry = ttk.Entry(ca_box, textvariable=self.custom_ca, width=38)
+        self._cert_entry.pack(side="left", padx=(4,4))
+        self._cert_browse = ttk.Button(ca_box, text="Browse…", command=self._browse_ca)
+        self._cert_browse.pack(side="left")
+        ttk.Button(frame, text="Generate now", command=self._generate_certificates).pack(anchor="w", pady=(10,0))
+        ttk.Label(frame, text="Output is stored under ./certs (ca.cert.pem, localhost.cert.pem, …).",
+                  foreground="#555", wraplength=420, justify="left").pack(anchor="w", pady=(6,0))
+
+    def _step_tls_mode(self, frame):
+        ttk.Label(frame, text="TLS verification mode", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        options = [
+            ("System trust store (recommended)", "System Trust"),
+            ("Insecure (accept self-signed certificates)", "Insecure (not recommended)"),
+            ("Use embedded CA from ./certs/ca.cert.pem", "Embedded CA (./certs/ca.cert.pem)"),
+            ("Pick a custom CA bundle…", "Pick file..."),
+        ]
+        for text, value in options:
+            ttk.Radiobutton(frame, text=text, variable=self.tls_choice, value=value, wraplength=420, justify="left").pack(anchor="w", pady=(4,0))
+        tls_box = ttk.Frame(frame)
+        tls_box.pack(fill="x", pady=(10,0))
+        ttk.Label(tls_box, text="CA bundle:").pack(side="left")
+        self._tls_entry = ttk.Entry(tls_box, textvariable=self.custom_ca, width=38)
+        self._tls_entry.pack(side="left", padx=(4,4))
+        self._tls_browse = ttk.Button(tls_box, text="Browse…", command=self._browse_ca)
+        self._tls_browse.pack(side="left")
+
+    def _step_server(self, frame):
+        ttk.Label(frame, text="Target MCP endpoint", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="Enter the full HTTPS URL of your MCP server.", foreground="#444").pack(anchor="w", pady=(6,0))
+        ttk.Entry(frame, textvariable=self.url_choice, width=50).pack(anchor="w", pady=(10,0))
+        ttk.Label(frame, text="Example: https://localhost:8443/mcp", foreground="#555").pack(anchor="w", pady=(6,0))
+
+    def _step_summary(self, frame):
+        ttk.Label(frame, text="Summary", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        summary = ttk.Frame(frame)
+        summary.pack(anchor="w", pady=(6,0))
+        entries = [
+            ("Certificates", "Generated locally" if self.cert_choice.get()=="generate" else (self.custom_ca.get() or "Existing path")),
+            ("TLS mode", self.tls_choice.get() or "System Trust"),
+            ("MCP server", self.url_choice.get().strip() or self.gui.url.get()),
+        ]
+        for label, value in entries:
+            row = ttk.Frame(summary)
+            row.pack(anchor="w", fill="x", pady=2)
+            ttk.Label(row, text=f"{label}:", width=14).pack(side="left")
+            ttk.Label(row, text=value or "-", foreground="#222").pack(side="left")
+        ttk.Label(frame, text="You can adjust any of these settings later in the main window.",
+                  foreground="#444").pack(anchor="w", pady=(12,0))
+
+    # ----- actions -----
+    def _browse_ca(self):
+        if filedialog is None:
+            return
+        path = filedialog.askopenfilename(title="CA-Bundle auswählen",
+                                          filetypes=[("Certificate files","*.pem *.crt *.cer *.ca-bundle"),("All files","*.*")])
+        if path:
+            self.custom_ca.set(path)
+            self.gui.ca.set(path)
+
+    def _generate_certificates(self):
+        self.gui._gen_ca()
+        default_ca = os.path.join(os.path.dirname(__file__), "certs", "ca.cert.pem")
+        self.custom_ca.set(default_ca)
+        self.gui.ca.set(default_ca)
+        self.tls_choice.set("Embedded CA (./certs/ca.cert.pem)")
+
+    def _update_cert_controls(self, *_):
+        mode = self.cert_choice.get()
+        state = "normal" if mode == "existing" else "disabled"
+        if hasattr(self, "_cert_entry"):
+            self._cert_entry.config(state=state)
+        if hasattr(self, "_cert_browse"):
+            self._cert_browse.config(state=state)
+
+    def _update_tls_controls(self, *_):
+        mode = self.tls_choice.get()
+        use_custom = mode == "Pick file..."
+        entry_state = "normal" if use_custom else "disabled"
+        if hasattr(self, "_tls_entry"):
+            self._tls_entry.config(state=entry_state)
+        if hasattr(self, "_tls_browse"):
+            self._tls_browse.config(state="normal" if use_custom else "disabled")
+
+    def _apply_validations(self):
+        if self.step_index == 1:
+            if self.cert_choice.get() == "generate":
+                self._generate_certificates()
+            else:
+                path = self.custom_ca.get().strip()
+                if not path:
+                    if messagebox: messagebox.showwarning("Certificates", "Bitte wähle eine CA-Datei aus.")
+                    return False
+                self.gui.ca.set(path)
+        elif self.step_index == 2:
+            choice = self.tls_choice.get() or "System Trust"
+            if choice == "Pick file..." and not self.custom_ca.get().strip():
+                if messagebox: messagebox.showwarning("TLS", "Bitte CA-Bundle auswählen oder anderen Modus wählen.")
+                return False
+            if choice == "Embedded CA (./certs/ca.cert.pem)":
+                default_ca = os.path.join(os.path.dirname(__file__), "certs", "ca.cert.pem")
+                self.gui.ca.set(default_ca)
+            if choice == "Insecure (not recommended)":
+                self.gui.ca.set("")
+            self.gui.tls_mode.set(choice)
+        elif self.step_index == 3:
+            url = self.url_choice.get().strip()
+            if not url:
+                if messagebox: messagebox.showwarning("MCP Server", "Bitte eine MCP-Server-URL eingeben.")
+                return False
+            self.gui.url.set(url)
+        return True
+
+    def _next(self):
+        if not self._apply_validations():
+            return
+        if self.step_index >= len(self.steps)-1:
+            self._finish()
+            return
+        self.step_index += 1
+        self._render_step()
+
+    def _back(self):
+        if self.step_index == 0:
+            return
+        self.step_index -= 1
+        self._render_step()
+
+    def _finish(self):
+        self.gui._wizard_closed()
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
 
 # --------------- CLI ---------------
 def run_cli(args):
