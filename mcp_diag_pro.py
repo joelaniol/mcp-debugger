@@ -1017,7 +1017,16 @@ class SetupWizard(tk.Toplevel):
 
         self.cert_choice = tk.StringVar(value="generate")
         self.cert_choice.trace_add("write", self._update_cert_controls)
-        self.custom_ca = tk.StringVar(value=self.gui.ca.get())
+        default_abs = os.path.join(os.path.dirname(__file__), "certs", "ca.cert.pem")
+        initial_ca = self.gui.ca.get()
+        if initial_ca:
+            if os.path.normcase(os.path.abspath(initial_ca)) == os.path.normcase(default_abs):
+                initial_display = self._default_ca_display()
+            else:
+                initial_display = initial_ca
+        else:
+            initial_display = self._default_ca_display()
+        self.custom_ca = tk.StringVar(value=initial_display)
         self.tls_choice = tk.StringVar(value=self.gui.tls_mode.get())
         self.tls_choice.trace_add("write", self._update_tls_controls)
         self._tls_options = [
@@ -1120,6 +1129,8 @@ class SetupWizard(tk.Toplevel):
         self._tls_entry.pack(side="left", padx=(4,4))
         self._tls_browse = ttk.Button(tls_box, text="Browse…", command=self._browse_ca)
         self._tls_browse.pack(side="left")
+        ttk.Label(frame, text="For embedded mode this points to ./certs/ca.cert.pem generated earlier.",
+                  foreground="#555", wraplength=420, justify="left").pack(anchor="w", pady=(6,0))
 
     def _step_server(self, frame):
         ttk.Label(frame, text="Target MCP endpoint", font=("Segoe UI", 10, "bold")).pack(anchor="w")
@@ -1157,7 +1168,7 @@ class SetupWizard(tk.Toplevel):
     def _generate_certificates(self):
         self.gui._gen_ca()
         default_ca = os.path.join(os.path.dirname(__file__), "certs", "ca.cert.pem")
-        self.custom_ca.set(default_ca)
+        self.custom_ca.set(self._default_ca_display())
         self.gui.ca.set(default_ca)
         self.tls_choice.set("Embedded CA (./certs/ca.cert.pem)")
 
@@ -1181,6 +1192,10 @@ class SetupWizard(tk.Toplevel):
             target = next((label for label,value in self._tls_options if value==self.tls_choice.get()), None)
             if target:
                 self._tls_combo.set(target)
+        if mode == "Embedded CA (./certs/ca.cert.pem)":
+            self.custom_ca.set(self._default_ca_display())
+        elif mode != "Pick file...":
+            self.custom_ca.set("")
 
     def _apply_validations(self):
         if self.step_index == 1:
@@ -1200,6 +1215,7 @@ class SetupWizard(tk.Toplevel):
             if choice == "Embedded CA (./certs/ca.cert.pem)":
                 default_ca = os.path.join(os.path.dirname(__file__), "certs", "ca.cert.pem")
                 self.gui.ca.set(default_ca)
+                self.custom_ca.set(self._default_ca_display())
             if choice == "Insecure (not recommended)":
                 self.gui.ca.set("")
             self.gui.tls_mode.set(choice)
@@ -1325,3 +1341,5 @@ def main():
 
 if __name__=="__main__":
     main()
+    def _default_ca_display(self):
+        return os.path.join(".", "certs", "ca.cert.pem")
