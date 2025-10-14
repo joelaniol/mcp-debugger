@@ -1020,7 +1020,6 @@ class ProGUI:
 
         tip = ttk.Label(self.root, text="Hinweis: Overall timeout gilt nur für den Gesamtcheck. Bearer nur via TLS.", foreground="#444")
         tip.pack(fill="x", **p)
-        self._update_auth_status()
 
     def _center_window(self, window, min_w=600, min_h=480):
         try:
