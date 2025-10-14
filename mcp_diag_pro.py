@@ -902,6 +902,7 @@ class ProGUI:
         ttk.Button(prof, text="Save (per URL)", command=self._save_profile).pack(side="left")
         ttk.Button(prof, text="Load", command=self._load_profile).pack(side="left")
         ttk.Button(prof, text="Delete", command=self._delete_profile).pack(side="left")
+        ttk.Button(prof, text="MCP Info", command=self._show_mcp_info).pack(side="left", padx=(6,0))
         ttk.Label(prof, text="⚠ Token wird lokal im Klartext gespeichert. Nur auf vertrauenswürdigen Geräten.").pack(side="left")
 
         body=ttk.PanedWindow(self.root, orient="horizontal"); body.pack(fill="both", expand=True, **p)
@@ -1222,32 +1223,123 @@ class ProGUI:
         self._apply_auth()
         self._save_settings()
 
+    def _collect_mcp_info(self):
+        info={"url": self.url.get().strip(), "errors":[]}
+        client=self._create_client(silent=True)
+        init_obj=None
+        try:
+            init_obj, init_resp = client.initialize()
+            result = init_obj.get("result") if isinstance(init_obj, dict) else {}
+            info["protocolVersion"] = result.get("protocolVersion")
+            caps = result.get("capabilities") or {}
+            info["capabilities"] = sorted(caps.keys())
+            info["serverInfo"] = result.get("serverInfo") or {}
+        except Exception as e:
+            info["errors"].append(f"initialize: {e}")
+        try:
+            client.initialized()
+        except Exception as e:
+            info["errors"].append(f"notifications/initialized: {e}")
+        def collect_list(name, func, key):
+            bucket={"count":0,"names":[]}
+            try:
+                obj, resp = func()
+                items=((obj.get("result") or {}).get(key) or []) if isinstance(obj, dict) else []
+                bucket["count"]=len(items)
+                bucket["names"]=[(items[i] or {}).get("name") or (items[i] or {}).get("uri") or "" for i in range(min(len(items),8))]
+            except Exception as exc:
+                info["errors"].append(f"{name}: {exc}")
+            info[name]=bucket
+        collect_list("tools", client.list_tools, "tools")
+        collect_list("prompts", client.list_prompts, "prompts")
+        collect_list("resources", client.list_resources, "resources")
+        try:
+            client.delete_session()
+        except Exception:
+            pass
+        return info
+
+    def _present_mcp_info(self, info):
+        if tk is None:
+            return
+        top = tk.Toplevel(self.root)
+        top.title("MCP-Info")
+        try:
+            top.transient(self.root)
+        except Exception:
+            pass
+        text = ScrolledText(top, width=80, height=24)
+        text.pack(fill="both", expand=True)
+        def write(label, value=""):
+            text.insert("end", f"{label}\n", ("section",))
+            if isinstance(value, dict):
+                text.insert("end", json.dumps(value, ensure_ascii=False, indent=2))
+            else:
+                text.insert("end", value if value else "–")
+            text.insert("end", "\n\n")
+        text.tag_config("section", font=("Segoe UI", 10, "bold"))
+        write("URL", info.get("url",""))
+        write("Protocol Version", info.get("protocolVersion") or "unbekannt")
+        write("Capabilities", ", ".join(info.get("capabilities") or []) or "keine")
+        server_info = info.get("serverInfo") or {}
+        if server_info:
+            write("Server Info", server_info)
+        tool_bucket = info.get("tools", {})
+        write("Tools", f"{tool_bucket.get('count',0)} gefunden\nBeispiele: {', '.join([n or '–' for n in tool_bucket.get('names',[])] or ['–'])}")
+        prompt_bucket = info.get("prompts", {})
+        write("Prompts", f"{prompt_bucket.get('count',0)} gefunden\nBeispiele: {', '.join([n or '–' for n in prompt_bucket.get('names',[])] or ['–'])}")
+        res_bucket = info.get("resources", {})
+        write("Resources", f"{res_bucket.get('count',0)} gefunden\nBeispiele: {', '.join([n or '–' for n in res_bucket.get('names',[])] or ['–'])}")
+        errors = info.get("errors") or []
+        if errors:
+            write("Hinweise", "\n".join(errors))
+        text.config(state="disabled")
+        ttk.Button(top, text="Close", command=top.destroy).pack(pady=6)
+
+    def _show_mcp_info(self):
+        self._sink("MCP-Info wird geladen …")
+        def worker():
+            info = self._collect_mcp_info()
+            self.root.after(0, lambda: self._present_mcp_info(info))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _create_client(self, extra_override=None, silent=False):
+        mode = self.tls_mode.get()
+        verify=True
+        if mode=="Insecure (not recommended)":
+            verify=False
+        elif mode=="Embedded CA (./certs/ca.cert.pem)":
+            p=os.path.join(os.path.dirname(__file__),"certs","ca.cert.pem")
+            verify=p if os.path.exists(p) else True
+            if not os.path.exists(p):
+                self._sink("WARN: ./certs/ca.cert.pem nicht gefunden. 'Generate CA+Server' ausführen oder TLS Mode wechseln.")
+        elif mode=="Pick file...":
+            p=self.ca.get().strip(); verify=p if p else True
+        url=self.url.get().strip()
+        try: to=float(self.timeout.get() or "30")
+        except: to=30.0
+        extra = extra_override if extra_override is not None else getattr(self, "_auth_extra", {})
+        if extra and mode=="Insecure (not recommended)":
+            self._sink("WARN: Bearer/API-Key niemals ohne TLS senden.")
+        if not verify:
+            try:
+                from urllib3.exceptions import InsecureRequestWarning
+                warnings.simplefilter("ignore", InsecureRequestWarning)
+            except Exception:
+                pass
+        if silent:
+            sink = Sink(gui_cb=None, mem_log=[])
+            def quiet_write(_self, line):
+                msg = f"[{ts()}] {line}"
+                _self.mem_log.append(msg)
+            sink.write = quiet_write.__get__(sink, Sink)  # type: ignore[attr-defined]
+        else:
+            sink = Sink(self._sink, self.mem_log)
+        return MCP(url, verify=verify, timeout=to, extra=extra, sink=sink, verbose=False)
+
     def _build_client(self, reset=False, extra_override=None):
         if reset or self.client is None:
-            mode = self.tls_mode.get()
-            verify=True
-            if mode=="Insecure (not recommended)":
-                verify=False
-            elif mode=="Embedded CA (./certs/ca.cert.pem)":
-                p=os.path.join(os.path.dirname(__file__),"certs","ca.cert.pem")
-                verify=p if os.path.exists(p) else True
-                if not os.path.exists(p):
-                    self._sink("WARN: ./certs/ca.cert.pem nicht gefunden. 'Generate CA+Server' ausführen oder TLS Mode wechseln.")
-            elif mode=="Pick file...":
-                p=self.ca.get().strip(); verify=p if p else True
-            url=self.url.get().strip()
-            try: to=float(self.timeout.get() or "30")
-            except: to=30.0
-            extra = extra_override if extra_override is not None else getattr(self, "_auth_extra", {})
-            if extra and mode=="Insecure (not recommended)":
-                self._sink("WARN: Bearer/API-Key niemals ohne TLS senden.")
-            if not verify:
-                try:
-                    from urllib3.exceptions import InsecureRequestWarning
-                    warnings.simplefilter("ignore", InsecureRequestWarning)
-                except Exception:
-                    pass
-            self.client = MCP(url, verify=verify, timeout=to, extra=extra, sink=Sink(self._sink, self.mem_log), verbose=False)
+            self.client = self._create_client(extra_override=extra_override)
         return self.client
 
     def _run_selected(self):
