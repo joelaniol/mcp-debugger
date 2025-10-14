@@ -16,7 +16,7 @@ except Exception:
     ScrolledText = None
     messagebox = None
 
-DEFAULT_PROTOCOL_VERSION = "2025-06-18"
+DEFAULT_PROTOCOL_VERSION = "2025-03-26"  # Latest stable MCP spec (supports legacy servers)
 
 def ts():
     return time.strftime("%H:%M:%S")
@@ -30,6 +30,9 @@ class Sink:
         msg = f"[{ts()}] {line}"
         print(msg, flush=True)
         self.mem_log.append(msg)
+        # Prevent memory leak: trim log if it grows too large
+        if len(self.mem_log) > 10000:
+            self.mem_log = self.mem_log[-5000:]
         if "Session-Objekt zurückgesetzt" in line or "Session-Objekt zur\u00fcckgesetzt" in line:
             self.session_resets += 1
         if self.gui_cb: self.gui_cb(msg)
@@ -40,11 +43,18 @@ class MCP:
         self.extra=dict(extra or {}); self.sid=""; self.proto=""; self._id=1
         self.sink=sink or Sink()
         self.verbose = verbose
+        self._session = None  # Lazy-initialized requests.Session for connection pooling
         self.last_request = None
         self.last_http = None
         self.last_body = None
         self._id_lock = threading.Lock()
         self._thread_local = threading.local()
+
+    def _get_session(self):
+        """Get or create requests.Session for connection pooling"""
+        if self._session is None:
+            self._session = requests.Session()
+        return self._session
 
     def _setup_logging(self):
         lvl = logging.DEBUG if self.verbose else logging.WARNING
@@ -127,7 +137,7 @@ class MCP:
         self.last_http={"method":"POST","url":self.url,"headers":h.copy(),"body":payload}
         self.sink.write(f">> POST {self.url} [initialize]"); self._log_h(h)
         self.sink.write(">> Body: " + json.dumps(payload, ensure_ascii=False))
-        r=requests.post(self.url, data=json.dumps(payload), headers=h, stream=True, verify=self.verify, timeout=self.timeout)
+        r=self._get_session().post(self.url, data=json.dumps(payload), headers=h, stream=True, verify=self.verify, timeout=self.timeout)
         self.sink.write(f"<< HTTP {r.status_code}  Content-Type: {r.headers.get('Content-Type','')}")
         sid=r.headers.get("Mcp-Session-Id",""); 
         if sid: self.sid=sid; self.sink.write(f"<< Mcp-Session-Id: {sid}")
@@ -158,7 +168,7 @@ class MCP:
         self.last_http={"method":"POST","url":self.url,"headers":h.copy(),"body":payload}
         self.sink.write(f">> POST {self.url} [notifications/initialized]"); self._log_h(h)
         self.sink.write(">> Body: " + json.dumps(payload, ensure_ascii=False))
-        r=requests.post(self.url, data=json.dumps(payload), headers=h, stream=False, verify=self.verify, timeout=self.timeout)
+        r=self._get_session().post(self.url, data=json.dumps(payload), headers=h, stream=False, verify=self.verify, timeout=self.timeout)
         self.sink.write(f"<< HTTP {r.status_code} (initialized)")
         return r
 
@@ -168,7 +178,7 @@ class MCP:
         h=self._h_post(accept_json_only=accept_json_only)
         self.last_request={"method":method,"headers":h,"payload":payload}
         self.last_http={"method":"POST","url":self.url,"headers":h.copy(),"body":payload}
-        snapshot = copy.deepcopy(self.last_request)
+        snapshot = self.last_request.copy() if isinstance(self.last_request, dict) else self.last_request
         try:
             self._thread_local.last_request = snapshot
         except Exception:
@@ -176,7 +186,7 @@ class MCP:
         self.sink.write(f">> POST {self.url} [{method}]"); self._log_h(h)
         self.sink.write(">> Body: " + json.dumps(payload, ensure_ascii=False))
         if self.sid: self.sink.write(f">> Using session: {self.sid}")
-        r=requests.post(self.url, data=json.dumps(payload), headers=h, stream=stream, verify=self.verify, timeout=self.timeout)
+        r=self._get_session().post(self.url, data=json.dumps(payload), headers=h, stream=stream, verify=self.verify, timeout=self.timeout)
         try:
             request_info = copy.deepcopy(getattr(self._thread_local, 'last_request', self.last_request))
         except Exception:
@@ -217,7 +227,7 @@ class MCP:
 
         if "text/event-stream" in ct:
             client=SSEClient(r)
-            deadline = time.time() + (sse_max_seconds or 30)
+            deadline = time.monotonic() + (sse_max_seconds or 30)
             for ev in client.events():
                 try:
                     d=json.loads(ev.data); self.last_body=d; self.sink.write(f"<< [SSE {ev.event or 'message'}] " + json.dumps(d, ensure_ascii=False))
@@ -225,7 +235,7 @@ class MCP:
                         return d, r
                 except Exception:
                     self.sink.write(f"<< [SSE raw] {ev.data}")
-                if time.time() >= deadline:
+                if time.monotonic() >= deadline:
                     self.sink.write("<< WARN: SSE read timed out; continuing.")
                     break
             return {}, r
@@ -244,7 +254,7 @@ class MCP:
         h=self._h_get()
         self.last_http={"method":"GET","url":self.url,"headers":h.copy(),"body":None}
         self.sink.write(f">> GET {self.url} [SSE] {seconds}s"); self._log_h(h)
-        r=requests.get(self.url, headers=h, stream=True, verify=self.verify, timeout=self.timeout)
+        r=self._get_session().get(self.url, headers=h, stream=True, verify=self.verify, timeout=self.timeout)
         self.sink.write(f"<< HTTP {r.status_code}  Content-Type: {r.headers.get('Content-Type','')}")
         ct=(r.headers.get("Content-Type") or "").lower()
         if "text/event-stream" not in ct:
@@ -260,7 +270,7 @@ class MCP:
         h=self._h_post()
         self.last_http={"method":"DELETE","url":self.url,"headers":h.copy(),"body":None}
         self.sink.write(f">> DELETE {self.url} [session]"); self._log_h(h)
-        r=requests.delete(self.url, headers=h, verify=self.verify, timeout=self.timeout)
+        r=self._get_session().delete(self.url, headers=h, verify=self.verify, timeout=self.timeout)
         self.sink.write(f"<< HTTP {r.status_code} (DELETE)")
         return r
 
@@ -690,6 +700,14 @@ class MCP:
                 add("MUST","Content-Type header", "OK" if ct.lower()=="application/json" else "FAIL", ct or "missing")
                 pv=(obj.get("result") or {}).get("protocolVersion") if isinstance(obj,dict) else None
                 add("MUST","Protocol-Version negotiated", "OK" if isinstance(pv,str) and pv else "FAIL", pv or "missing")
+                # Check for legacy/outdated protocol versions
+                if isinstance(pv, str) and pv:
+                    requested_ver = DEFAULT_PROTOCOL_VERSION
+                    legacy_versions = ["2024-11-05"]
+                    if pv in legacy_versions:
+                        add("INFO", "Legacy protocol version detected", "WARN", f"Server uses {pv} (legacy SSE-based). Requested: {requested_ver}")
+                    elif pv < requested_ver:
+                        add("INFO", "Outdated protocol version", "WARN", f"Server: {pv}, Client requested: {requested_ver}")
                 caps=(obj.get("result") or {}).get("capabilities") if isinstance(obj,dict) else None
                 add("MUST","Capabilities object in InitializeResult", "OK" if isinstance(caps, dict) else "FAIL", "present" if isinstance(caps,dict) else "missing")
                 s_info=(obj.get("result") or {}).get("serverInfo") if isinstance(obj,dict) else None
@@ -826,7 +844,10 @@ class ProGUI:
 
 
 
-        self._state = self._load_state()
+        try:
+            self._state = self._load_state()
+        except Exception:
+            self._state = {}  # Fallback to empty state on load error
         state_defaults={
             "url":"https://localhost:5000/mcp",
             "tls_mode":"Insecure (not recommended)",
@@ -879,6 +900,11 @@ class ProGUI:
 
     def _sink(self, m):
         self.mem_log.append(m)
+        # Prevent memory leak: trim log if it grows too large
+        if len(self.mem_log) > 10000:
+            self.mem_log = self.mem_log[-5000:]
+        if len(self.mem_log) > 10000:
+            self.mem_log = self.mem_log[-5000:]
         self.q.put(m)
 
     def _pump(self):
@@ -1430,6 +1456,11 @@ class ProGUI:
         write("Zeitpunkt", info.get("timestamp",""))
         write("URL", info.get("url",""))
         proto = info.get("protocolVersion") or "unbekannt"
+        legacy_versions = ["2024-11-05"]
+        if proto in legacy_versions:
+            proto = f"{proto} ⚠ LEGACY (SSE-based, outdated)"
+        elif proto != "unbekannt" and proto < DEFAULT_PROTOCOL_VERSION:
+            proto = f"{proto} ⚠ OUTDATED (latest: {DEFAULT_PROTOCOL_VERSION})"
         write("Protokoll-Version", proto)
         caps = ", ".join(info.get("capabilities") or []) or "keine"
         write("Bereitgestellte Fähigkeiten", caps)
@@ -1481,8 +1512,14 @@ class ProGUI:
             init_http=getattr(init_resp,"status_code","n/a")
             result = init_obj.get("result") if isinstance(init_obj, dict) else {}
             session_id=getattr(client,"sid","")
+            proto_ver = result.get("protocolVersion") or "unbekannt"
+            legacy_versions = ["2024-11-05"]
+            if proto_ver in legacy_versions:
+                proto_ver = f"{proto_ver} ⚠ LEGACY"
+            elif proto_ver != "unbekannt" and proto_ver < DEFAULT_PROTOCOL_VERSION:
+                proto_ver = f"{proto_ver} ⚠ OUTDATED"
             handshake_items=[
-                {"label":"Protokoll-Version","details":result.get("protocolVersion") or "unbekannt"},
+                {"label":"Protokoll-Version","details":proto_ver},
                 {"label":"HTTP Status","details":f"{init_http} · {init_ms} ms"},
                 {"label":"Session-ID","details":session_id or "keine"},
             ]
@@ -1604,6 +1641,11 @@ class ProGUI:
                 def write(self, line):
                     msg = f"[{ts()}] {line}"
                     self.mem_log.append(msg)
+                    # Prevent memory leak: trim log if it grows too large
+                    if len(self.mem_log) > 10000:
+                        self.mem_log = self.mem_log[-5000:]
+                    if len(self.mem_log) > 10000:
+                        self.mem_log = self.mem_log[-5000:]
                     if "Session-Objekt zurückgesetzt" in line or "Session-Objekt zur\u00fcckgesetzt" in line:
                         self.session_resets += 1
             sink = QuietSink(gui_cb=None, mem_log=[])
