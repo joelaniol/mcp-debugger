@@ -2,6 +2,8 @@
 Read carefully before using.
 
 # MCP Debugger - Windows Installer
+*Current release: MCP Diagnoser v4.3*
+
 
 > EN: This repository only contains the Windows setup base. Anything generated during installation (virtual environments, certificates, caches, etc.) must stay out of Git and is covered by `.gitignore`.
 >
@@ -97,10 +99,19 @@ Refer to `mcp_diag_pro.py --help` for the complete parameter list.
 Der MCP Debugger (MCP Diagnoser PRO) ist ein Desktop-Werkzeug, um HTTP/SSE-basierte MCP-Server End-to-End zu testen. Er richtet lokal eine Python-Laufzeit ein, startet die GUI und erlaubt zielgerichtete oder umfangreiche Diagnoselaeufe gegen deine Server – inklusive Streaming-Events.
 
 ### Wichtige Funktionen
+### Neu in v4.3
+- Live-Verbindungsmonitor mit Herzschlagwarnung und JSON-Pruefung.
+- Kontext-Navigator mit Scrollbar, Tool-Runner und Hinweisbereich.
+- Fortschrittsdialog fuer den Gesamttest, damit die GUI weiterhin reagiert.
+- Neues Ereignis-Tab und Log-Filter (Stichwort, Warnmodus, Laufnummern).
+- Erweitertes Testlabor (Mini-Timeout, grosse Payload, fehlender Accept-Header).
+
 - Windows-Installer-Skript (`setup_and_run.bat`), das eine virtuelle Umgebung aufbaut, Abhaengigkeiten installiert und die GUI startet.
-- Visuelle Oberflaeche zum Ausfuehren einzelner Tool-Calls, Audit-Laeufe und zum Exportieren von Logs.
-- Vollstaendige HTTP- und SSE-Diagnostik (Stream-Capture, Timeouts, Fallbacks).
-- Audit-Metriken erfassen Latenz, Payload-Groesse und Token-Schaetzungen pro Tool-Call.
+- Gefuehrte Oberflaeche fuer Einzeltests, "Run all"-Audits mit Fortschrittsdialog und umfangreiche Exportoptionen (JSON, .http, ZIP).
+- Live-Verbindungsmonitor (SSE) mit Herzschlagwarnung, JSON-Check und Ereignisprotokoll.
+- Kontext-Navigator mit Ebenenuebersicht (Handshake, Tools, Prompts, Ressourcen) und direktem Tool-Start.
+- Ereignistab + Logfilter (Suchfeld, Warnmodus, Laufnummern) fuer eine schnelle Fehlersuche.
+- Testlabor fuer typische Fehlerszenarien (ungueltige Argumente, unbekannte Methoden, SSE-Abbruch, Mini-Timeout, grosse Payload, fehlender Accept-Header).
 - Zertifikats-Helfer (`certgen_ca_server.py`) fuer eine lokale Root-CA und Server-Zertifikate fuer TLS-Tests auf localhost.
 
 ### Test-Schema
