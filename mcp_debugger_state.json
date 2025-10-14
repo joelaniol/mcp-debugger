@@ -9,5 +9,6 @@
   "auth_token": "",
   "auth_header": "Authorization",
   "overall_delay": "200",
-  "audit_delay": "200"
+  "audit_delay": "200",
+  "auth_enabled": false
 }

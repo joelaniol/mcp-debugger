@@ -1192,6 +1192,36 @@ class ProGUI:
             self._sink(result.log)
         self.client = None
 
+    def _current_auth_state(self):
+        return AuthState(
+            mode=self.auth_mode.get(),
+            token=self.auth_token.get(),
+            header=self.auth_header.get(),
+            enabled=bool(self.auth_enabled.get()),
+        )
+
+    def _set_auth_labels(self, result):
+        self.auth_status.set(result.status)
+        self.auth_toggle_text.set(result.toggle)
+
+    def _update_auth_status(self):
+        self._set_auth_labels(self._current_auth_state().compute())
+
+    def _toggle_auth(self):
+        state = self._current_auth_state()
+        if state.effective():
+            self.auth_enabled.set(False)
+            self._apply_auth()
+            self._save_settings()
+            return
+        if not state.ready():
+            self._sink("Auth: Bitte zuerst im Authentifizierungsmanager konfigurieren.")
+            self._open_token_manager()
+            return
+        self.auth_enabled.set(True)
+        self._apply_auth()
+        self._save_settings()
+
     def _build_client(self, reset=False, extra_override=None):
         if reset or self.client is None:
             mode = self.tls_mode.get()
@@ -2148,34 +2178,3 @@ def main():
 
 if __name__=="__main__":
     main()
-    def _default_ca_display(self):
-        return os.path.join(".", "certs", "ca.cert.pem")
-    def _current_auth_state(self):
-        return AuthState(
-            mode=self.auth_mode.get(),
-            token=self.auth_token.get(),
-            header=self.auth_header.get(),
-            enabled=bool(self.auth_enabled.get()),
-        )
-
-    def _set_auth_labels(self, result):
-        self.auth_status.set(result.status)
-        self.auth_toggle_text.set(result.toggle)
-
-    def _update_auth_status(self):
-        self._set_auth_labels(self._current_auth_state().compute())
-
-    def _toggle_auth(self):
-        state = self._current_auth_state()
-        if state.effective():
-            self.auth_enabled.set(False)
-            self._apply_auth()
-            self._save_settings()
-            return
-        if not state.ready():
-            self._sink("Auth: Bitte zuerst im Authentifizierungsmanager konfigurieren.")
-            self._open_token_manager()
-            return
-        self.auth_enabled.set(True)
-        self._apply_auth()
-        self._save_settings()
