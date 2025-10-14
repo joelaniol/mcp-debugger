@@ -1,0 +1,140 @@
+        self._audit_done = 0
+        self._audit_running = 0
+        self.audit_progress.set("")
+        try:
+            self.audit.configure(cursor="")
+        except Exception:
+            pass
+
+    def _open_token_manager(self):
+        if tk is None:
+            self._sink("Authentifizierungsmanager nicht verfügbar (Tkinter fehlt).")
+            return
+        existing = getattr(self, "_token_manager", None)
+        if existing and str(existing) and existing.winfo_exists():
+            try:
+                existing.lift()
+                existing.focus_force()
+            except Exception:
+                pass
+            return
+        self._token_manager = TokenManagerDialog(self)
+
+    def _open_sse_monitor(self):
+        if tk is None:
+            self._sink("SSE-Monitor nicht verfügbar (Tkinter fehlt).")
+            return
+        existing = getattr(self, "_sse_monitor", None)
+        if existing and str(existing) and existing.winfo_exists():
+            try:
+                existing.lift()
+                existing.focus_force()
+            except Exception:
+                pass
+            return
+        self._sse_monitor = SSEMonitorDialog(self)
+
+    def _open_test_lab(self):
+        if tk is None:
+            self._sink("Testlabor nicht verfügbar (Tkinter fehlt).")
+            return
+        existing = getattr(self, "_test_lab", None)
+        if existing and str(existing) and existing.winfo_exists():
+            try:
+                existing.lift()
+                existing.focus_force()
+            except Exception:
+                pass
+            return
+        self._test_lab = TestLabDialog(self)
+
+    def _on_audit_tree_click(self, event):
+        region = self.audit.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = self.audit.identify_column(event.x)
+        if column != "#6":
+            return
+        item = self.audit.identify_row(event.y)
+        if not item:
+            return
+        self._open_audit_detail(item)
+
+    def _on_audit_motion(self, event):
+        region = self.audit.identify("region", event.x, event.y)
+        column = self.audit.identify_column(event.x)
+        if region == "cell" and column == "#6":
+            self.audit.configure(cursor="hand2")
+        else:
+            self.audit.configure(cursor="")
+
+    def _open_audit_detail(self, item):
+        data = self._audit_row_data.get(item)
+        if not data:
+            return
+        top = tk.Toplevel(self.root)
+        top.title(f"Audit detail - {data.get('tool','')}")
+        try:
+            top.transient(self.root)
+        except Exception:
+            pass
+        txt = ScrolledText(top, width=100, height=34)
+        txt.pack(fill="both", expand=True)
+        txt.configure(font=("Consolas", 10))
+        def _write_block(title, payload):
+            txt.insert("end", f"{title}\n", ("section",))
+            if isinstance(payload, (dict, list)):
+                txt.insert("end", json.dumps(payload, ensure_ascii=False, indent=2))
+            elif payload is None:
+                txt.insert("end", "(none)")
+            else:
+                txt.insert("end", str(payload))
+            txt.insert("end", "\n\n")
+        txt.tag_config("section", font=("Segoe UI", 10, "bold"))
+        _write_block("Tool", data.get("tool"))
+        _write_block("Status", data.get("status"))
+        _write_block("Detail", data.get("detail"))
+        _write_block("Timing (ms)", data.get("ms"))
+        _write_block("Tokens", data.get("tokens"))
+        _write_block("Kilobytes", data.get("kb"))
+        _write_block("Arguments", data.get("args"))
+        _write_block("HTTP status", data.get("http"))
+        _write_block("HTTP headers", data.get("http_headers"))
+        _write_block("Request payload", data.get("request"))
+        _write_block("Response payload", data.get("response"))
+        timeline = data.get("timeline") or []
+        if timeline:
+            lines=[]
+            for ev in timeline:
+                ts = ev.get("ts")
+                when = time.strftime("%H:%M:%S", time.localtime(ts)) if isinstance(ts, (int, float)) else "?"
+                phase = ev.get("phase") or ""
+                status = ev.get("status") or ""
+                ms = ev.get("ms")
+                extra = f" · {ms} ms" if isinstance(ms, (int, float)) else ""
+                parts = [p for p in (when, phase, f"Status: {status}" if status else "") if p]
+                lines.append(" | ".join(parts) + extra)
+            _write_block("Ablauf", "\n".join(lines))
+        txt.config(state="disabled")
+        txt.see("1.0")
+        ttk.Button(top, text="Close", command=top.destroy).pack(pady=6)
+
+    def _open_tree(self):
+        c=self._build_client(reset=False)
+        data = c.last_body if c and c.last_body is not None else {}
+        top=tk.Toplevel(self.root); top.title("Last JSON result")
+        tv=ttk.Treeview(top, columns=("value",), show="tree headings")
+        tv.heading("value", text="Value"); tv.pack(fill="both", expand=True)
+        def add_node(parent, key, val):
+            label=str(key)
+            if isinstance(val, dict):
+                nid=tv.insert(parent, "end", text=label, values=("",))
+                for k,v in val.items(): add_node(nid, k, v)
+            elif isinstance(val, list):
+                nid=tv.insert(parent, "end", text=f"{label} []", values=("",))
+                for i,v in enumerate(val): add_node(nid, i, v)
+            else:
+                tv.insert(parent, "end", text=label, values=(str(val),))
+        add_node("", "root", data)
+        for n in tv.get_children(): tv.item(n, open=True)
+
