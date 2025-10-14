@@ -537,9 +537,21 @@ class MCP:
                 ms = 0
                 kb = 0.0
                 tokens = 0
+                call_id = f"{name}-{int(time.time()*1000)}-{threading.get_ident()}"
+                start_wall = time.time()
+                if on_progress:
+                    try:
+                        on_progress({"meta":"timeline","phase":"start","tool":name,"call_id":call_id,"ts":start_wall})
+                    except Exception:
+                        pass
                 if not ok:
-                    res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":None}
-                    if on_progress: on_progress(res)
+                    res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":None,"call_id":call_id}
+                    if on_progress: 
+                        on_progress(res)
+                        try:
+                            on_progress({"meta":"timeline","phase":"end","tool":name,"call_id":call_id,"ts":time.time(),"status":status,"ms":ms})
+                        except Exception:
+                            pass
                     return res
                 try:
                     start=time.monotonic()
@@ -598,22 +610,27 @@ class MCP:
                             detail = (detail + ("; " if detail else "") + f"{out_status}: {out_detail}").strip("; ")
                     else:
                         status="HTTP_ERROR"; detail=f"HTTP {resp.status_code}"
-                    res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":resp.status_code,"request":req_snapshot,"response":obj,"http_headers":dict(getattr(resp, "headers", {}))}
+                    res={"tool":name,"status":status,"detail":detail,"ms":ms,"kb":kb,"tokens":tokens,"args":args,"http":resp.status_code,"request":req_snapshot,"response":obj,"http_headers":dict(getattr(resp, "headers", {})),"call_id":call_id}
                 except requests.exceptions.Timeout as e:
                     ms = int(round((time.monotonic()-start)*1000))
                     try:
                         req_snapshot_timeout = copy.deepcopy(getattr(self._thread_local, 'last_request', self.last_request))
                     except Exception:
                         req_snapshot_timeout = getattr(self._thread_local, 'last_request', self.last_request)
-                    res={"tool":name,"status":"TIMEOUT","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None,"request":req_snapshot_timeout,"response":None,"http_headers":{}}
+                    res={"tool":name,"status":"TIMEOUT","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None,"request":req_snapshot_timeout,"response":None,"http_headers":{},"call_id":call_id}
                 except Exception as e:
                     ms = int(round((time.monotonic()-start)*1000))
                     try:
                         req_snapshot_exc = copy.deepcopy(getattr(self._thread_local, 'last_request', self.last_request))
                     except Exception:
                         req_snapshot_exc = getattr(self._thread_local, 'last_request', self.last_request)
-                    res={"tool":name,"status":"EXCEPTION","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None,"request":req_snapshot_exc,"response":None,"http_headers":{}}
-                if on_progress: on_progress(res)
+                    res={"tool":name,"status":"EXCEPTION","detail":str(e),"ms":ms,"kb":0.0,"tokens":0,"args":args,"http":None,"request":req_snapshot_exc,"response":None,"http_headers":{},"call_id":call_id}
+                if on_progress: 
+                    on_progress(res)
+                    try:
+                        on_progress({"meta":"timeline","phase":"end","tool":name,"call_id":call_id,"ts":time.time(),"status":res.get("status"),"ms":ms})
+                    except Exception:
+                        pass
                 if throttle_delay>0.0:
                     time.sleep(throttle_delay)
                 return res
@@ -844,6 +861,10 @@ class ProGUI:
         self.auth_toggle_text=tk.StringVar(value="")
         self._wizard_active=False
         self._token_manager=None
+        self._sse_monitor=None
+        self._test_lab=None
+        self.log_filter=tk.StringVar(value="")
+        self.log_warn_only=tk.BooleanVar(value=False)
         self._build()
         self._apply_auth(silent=True)
         self._center_window(self.root, min_w=900, min_h=640)
@@ -857,11 +878,53 @@ class ProGUI:
 
     def _pump(self):
         try:
+            dirty=False
             while True:
                 m=self.q.get_nowait()
-                self.console.insert("end", m+"\n"); self.console.see("end")
-        except queue.Empty: pass
+                dirty=True
+                if not self._log_filter_active():
+                    self.console.configure(state="normal")
+                    self.console.insert("end", m+"\n"); self.console.see("end")
+                    self.console.configure(state="disabled")
+        except queue.Empty:
+            pass
+        if self._log_filter_active() and dirty:
+            self._refresh_console()
         self.root.after(60, self._pump)
+
+    def _log_filter_active(self):
+        return bool(self.log_filter.get().strip()) or bool(self.log_warn_only.get())
+
+    def _filtered_log_lines(self):
+        keyword=self.log_filter.get().strip().lower()
+        warn_only=self.log_warn_only.get()
+        filtered=[]
+        for line in self.mem_log:
+            check=line.lower()
+            if warn_only and not any(tag in line for tag in ("WARN","FAIL","ERROR","ERR","⚠")):
+                continue
+            if keyword and keyword not in check:
+                continue
+            filtered.append(line)
+        return filtered
+
+    def _refresh_console(self):
+        lines=self._filtered_log_lines()
+        self.console.configure(state="normal")
+        self.console.delete("1.0","end")
+        for line in lines:
+            self.console.insert("end", line+"\n")
+        if lines:
+            self.console.see("end")
+        self.console.configure(state="disabled")
+
+    def _apply_log_filter(self):
+        self._refresh_console()
+
+    def _reset_log_filter(self):
+        self.log_filter.set("")
+        self.log_warn_only.set(False)
+        self._refresh_console()
 
     def _build(self):
         p={"padx":6,"pady":4}
@@ -903,6 +966,8 @@ class ProGUI:
         ttk.Button(prof, text="Load", command=self._load_profile).pack(side="left")
         ttk.Button(prof, text="Delete", command=self._delete_profile).pack(side="left")
         ttk.Button(prof, text="MCP Info", command=self._show_mcp_info).pack(side="left", padx=(6,0))
+        ttk.Button(prof, text="Live-Verbindung", command=self._open_sse_monitor).pack(side="left", padx=(6,0))
+        ttk.Button(prof, text="Testlabor…", command=self._open_test_lab).pack(side="left", padx=(6,0))
         ttk.Label(prof, text="⚠ Token wird lokal im Klartext gespeichert. Nur auf vertrauenswürdigen Geräten.").pack(side="left")
 
         body=ttk.PanedWindow(self.root, orient="horizontal"); body.pack(fill="both", expand=True, **p)
@@ -1017,7 +1082,16 @@ class ProGUI:
         ttk.Button(rightbtns, text="Save last request (.http)", command=self._save_httpfile).pack(side="left")
 
         ttk.Label(right, text="Console:").pack(anchor="w")
+        logtools = ttk.Frame(right); logtools.pack(fill="x")
+        ttk.Label(logtools, text="Filter:").pack(side="left")
+        entry = ttk.Entry(logtools, textvariable=self.log_filter, width=24)
+        entry.pack(side="left", padx=(2,6))
+        ttk.Button(logtools, text="Anwenden", command=self._apply_log_filter).pack(side="left")
+        ttk.Button(logtools, text="Zurücksetzen", command=self._reset_log_filter).pack(side="left", padx=(4,0))
+        entry.bind("<Return>", lambda e: self._apply_log_filter())
+        ttk.Checkbutton(logtools, text="Nur Warnungen/Fehler", variable=self.log_warn_only, command=self._apply_log_filter).pack(side="left", padx=(8,0))
         self.console=ScrolledText(right, height=24); self.console.pack(fill="both", expand=True)
+        self.console.configure(state="disabled")
 
         tip = ttk.Label(self.root, text="Hinweis: Overall timeout gilt nur für den Gesamtcheck. Bearer nur via TLS.", foreground="#444")
         tip.pack(fill="x", **p)
@@ -1068,7 +1142,9 @@ class ProGUI:
         pl={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":DEFAULT_PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"mcp-diagnoser-pro","version":"0.4.2"}}}
         self.payload.delete("1.0","end"); self.payload.insert("1.0", json.dumps(pl, indent=2))
 
-    def _clear(self): self.console.delete("1.0","end"); self.mem_log.clear()
+    def _clear(self):
+        self.mem_log.clear()
+        self._refresh_console()
     def _reset_session(self): self.client=None; self._sink("Session-Objekt zurückgesetzt.")
 
     def _pick_ca(self):
@@ -1224,11 +1300,19 @@ class ProGUI:
         self._save_settings()
 
     def _collect_mcp_info(self):
-        info={"url": self.url.get().strip(), "errors":[]}
+        info={
+            "url": self.url.get().strip(),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "errors":[],
+        }
         client=self._create_client(silent=True)
         init_obj=None
         try:
+            start=time.monotonic()
             init_obj, init_resp = client.initialize()
+            info["initializeMs"] = int((time.monotonic()-start)*1000)
+            info["httpInitialize"] = getattr(init_resp, "status_code", "n/a")
+            info["sessionId"] = getattr(client, "sid", "")
             result = init_obj.get("result") if isinstance(init_obj, dict) else {}
             info["protocolVersion"] = result.get("protocolVersion")
             caps = result.get("capabilities") or {}
@@ -1240,21 +1324,31 @@ class ProGUI:
             client.initialized()
         except Exception as e:
             info["errors"].append(f"notifications/initialized: {e}")
-        def collect_list(name, func, key):
-            bucket={"count":0,"names":[]}
+        def collect_list(name, func, key, label_key="name"):
+            bucket={"count":0,"examples":[]}
             try:
+                start=time.monotonic()
                 obj, resp = func()
+                bucket["http"] = getattr(resp, "status_code", "n/a")
+                bucket["ms"] = int((time.monotonic()-start)*1000)
                 items=((obj.get("result") or {}).get(key) or []) if isinstance(obj, dict) else []
                 bucket["count"]=len(items)
-                bucket["names"]=[(items[i] or {}).get("name") or (items[i] or {}).get("uri") or "" for i in range(min(len(items),8))]
+                previews=[]
+                for item in items[:5]:
+                    if isinstance(item, dict):
+                        previews.append(item.get(label_key) or item.get("uri") or "")
+                    else:
+                        previews.append(str(item))
+                bucket["examples"]=previews
             except Exception as exc:
                 info["errors"].append(f"{name}: {exc}")
             info[name]=bucket
         collect_list("tools", client.list_tools, "tools")
         collect_list("prompts", client.list_prompts, "prompts")
-        collect_list("resources", client.list_resources, "resources")
+        collect_list("resources", client.list_resources, "resources", label_key="name")
         try:
-            client.delete_session()
+            if getattr(client, "sid", ""):
+                client.delete_session()
         except Exception:
             pass
         return info
@@ -1278,23 +1372,40 @@ class ProGUI:
                 text.insert("end", value if value else "–")
             text.insert("end", "\n\n")
         text.tag_config("section", font=("Segoe UI", 10, "bold"))
+        write("Zeitpunkt", info.get("timestamp",""))
         write("URL", info.get("url",""))
-        write("Protocol Version", info.get("protocolVersion") or "unbekannt")
-        write("Capabilities", ", ".join(info.get("capabilities") or []) or "keine")
+        proto = info.get("protocolVersion") or "unbekannt"
+        write("Protokoll-Version", proto)
+        caps = ", ".join(info.get("capabilities") or []) or "keine"
+        write("Bereitgestellte Fähigkeiten", caps)
         server_info = info.get("serverInfo") or {}
         if server_info:
-            write("Server Info", server_info)
-        tool_bucket = info.get("tools", {})
-        write("Tools", f"{tool_bucket.get('count',0)} gefunden\nBeispiele: {', '.join([n or '–' for n in tool_bucket.get('names',[])] or ['–'])}")
-        prompt_bucket = info.get("prompts", {})
-        write("Prompts", f"{prompt_bucket.get('count',0)} gefunden\nBeispiele: {', '.join([n or '–' for n in prompt_bucket.get('names',[])] or ['–'])}")
-        res_bucket = info.get("resources", {})
-        write("Resources", f"{res_bucket.get('count',0)} gefunden\nBeispiele: {', '.join([n or '–' for n in res_bucket.get('names',[])] or ['–'])}")
+            write("Server-Details", server_info)
+        init_ms = info.get("initializeMs")
+        if init_ms is not None:
+            status = info.get("httpInitialize", "n/a")
+            session = info.get("sessionId") or "–"
+            write("Handshake", f"HTTP {status} · {init_ms} ms · Session: {session}")
+        def render_bucket(title, bucket):
+            count = bucket.get("count",0)
+            examples = bucket.get("examples") or []
+            if examples:
+                sample = ", ".join(ex if ex else "–" for ex in examples)
+            else:
+                sample = "keine Beispiele"
+            extra = ""
+            if "ms" in bucket:
+                extra = f" · {bucket['ms']} ms"
+            icon = "✅" if count else "⚠"
+            write(f"{icon} {title}", f"{count} Einträge{extra}\nBeispiele: {sample}")
+        render_bucket("Tools", info.get("tools", {}))
+        render_bucket("Prompts", info.get("prompts", {}))
+        render_bucket("Resources", info.get("resources", {}))
         errors = info.get("errors") or []
         if errors:
             write("Hinweise", "\n".join(errors))
         text.config(state="disabled")
-        ttk.Button(top, text="Close", command=top.destroy).pack(pady=6)
+        ttk.Button(top, text="Schließen", command=top.destroy).pack(pady=6)
 
     def _show_mcp_info(self):
         self._sink("MCP-Info wird geladen …")
@@ -1328,11 +1439,13 @@ class ProGUI:
             except Exception:
                 pass
         if silent:
-            sink = Sink(gui_cb=None, mem_log=[])
-            def quiet_write(_self, line):
-                msg = f"[{ts()}] {line}"
-                _self.mem_log.append(msg)
-            sink.write = quiet_write.__get__(sink, Sink)  # type: ignore[attr-defined]
+            class QuietSink(Sink):
+                def write(self, line):
+                    msg = f"[{ts()}] {line}"
+                    self.mem_log.append(msg)
+                    if "Session-Objekt zurückgesetzt" in line or "Session-Objekt zur\u00fcckgesetzt" in line:
+                        self.session_resets += 1
+            sink = QuietSink(gui_cb=None, mem_log=[])
         else:
             sink = Sink(self._sink, self.mem_log)
         return MCP(url, verify=verify, timeout=to, extra=extra, sink=sink, verbose=False)
@@ -1459,6 +1572,7 @@ class ProGUI:
     def _run_audit(self):
         for i in self.audit.get_children(): self.audit.delete(i)
         self._audit_row_data = {}
+        self._audit_timelines = {}
         self._audit_stop=False
         c=self._build_client(reset=False)
         if c.sid=="":
@@ -1548,6 +1662,7 @@ class ProGUI:
 
     def _clear_audit(self):
         self._audit_row_data = {}
+        self._audit_timelines = {}
         self.audit.delete(*self.audit.get_children())
         self._audit_total = 0
         self._audit_done = 0
@@ -1571,6 +1686,34 @@ class ProGUI:
                 pass
             return
         self._token_manager = TokenManagerDialog(self)
+
+    def _open_sse_monitor(self):
+        if tk is None:
+            self._sink("SSE-Monitor nicht verfügbar (Tkinter fehlt).")
+            return
+        existing = getattr(self, "_sse_monitor", None)
+        if existing and str(existing) and existing.winfo_exists():
+            try:
+                existing.lift()
+                existing.focus_force()
+            except Exception:
+                pass
+            return
+        self._sse_monitor = SSEMonitorDialog(self)
+
+    def _open_test_lab(self):
+        if tk is None:
+            self._sink("Testlabor nicht verfügbar (Tkinter fehlt).")
+            return
+        existing = getattr(self, "_test_lab", None)
+        if existing and str(existing) and existing.winfo_exists():
+            try:
+                existing.lift()
+                existing.focus_force()
+            except Exception:
+                pass
+            return
+        self._test_lab = TestLabDialog(self)
 
     def _on_audit_tree_click(self, event):
         region = self.audit.identify("region", event.x, event.y)
@@ -1866,6 +2009,308 @@ class TokenManagerDialog(tk.Toplevel):
             pass
         self.destroy()
 
+class SSEMonitorDialog(tk.Toplevel):
+    def __init__(self, gui):
+        super().__init__(gui.root)
+        self.gui = gui
+        self.title("Live-Verbindung (SSE)")
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._response = None
+        self.status = tk.StringVar(value="Bereit")
+        self.last_event = tk.StringVar(value="–")
+        self.event_count = tk.IntVar(value=0)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        info = ttk.Frame(frame)
+        info.pack(fill="x")
+        ttk.Label(info, text="Status:").grid(row=0, column=0, sticky="w")
+        ttk.Label(info, textvariable=self.status).grid(row=0, column=1, sticky="w", padx=(4,0))
+        ttk.Label(info, text="Letztes Ereignis:").grid(row=1, column=0, sticky="w")
+        ttk.Label(info, textvariable=self.last_event).grid(row=1, column=1, sticky="w", padx=(4,0))
+        ttk.Label(info, text="Anzahl Events:").grid(row=2, column=0, sticky="w")
+        ttk.Label(info, textvariable=self.event_count).grid(row=2, column=1, sticky="w", padx=(4,0))
+
+        self.log = ScrolledText(frame, height=18, width=80)
+        self.log.pack(fill="both", expand=True, pady=(10,0))
+        self.log.configure(state="disabled", font=("Consolas", 10))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(10,0))
+        self.start_btn = ttk.Button(buttons, text="Starten", command=self._start_monitor)
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(buttons, text="Stoppen", command=self._stop_monitor, state="disabled")
+        self.stop_btn.pack(side="left", padx=(6,0))
+        ttk.Button(buttons, text="Schließen", command=self._close).pack(side="right")
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        try:
+            self.transient(gui.root)
+            self.grab_set()
+        except Exception:
+            pass
+
+    def _set_running(self, running: bool):
+        try:
+            if running:
+                self.start_btn.config(state="disabled")
+                self.stop_btn.config(state="normal")
+            else:
+                self.start_btn.config(state="normal")
+                self.stop_btn.config(state="disabled")
+        except Exception:
+            pass
+
+    def _append_log(self, text):
+        self.log.configure(state="normal")
+        self.log.insert("end", text + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _post(self, func, *args):
+        try:
+            self.after(0, lambda: func(*args))
+        except Exception:
+            pass
+
+    def _start_monitor(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self.event_count.set(0)
+        self.last_event.set("–")
+        self.status.set("Verbinde …")
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        self._set_running(True)
+        self._thread = threading.Thread(target=self._run_monitor, daemon=True)
+        self._thread.start()
+
+    def _stop_monitor(self):
+        if not self._thread or not self._thread.is_alive():
+            return
+        self._stop_event.set()
+        self.status.set("Beende …")
+
+    def _close(self):
+        self._stop_monitor()
+        try:
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self.gui._sse_monitor = None
+        except Exception:
+            pass
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+    def _run_monitor(self):
+        client = None
+        try:
+            client = self.gui._create_client(silent=True)
+            start = time.monotonic()
+            client.initialize()
+            client.initialized()
+            init_latency = int((time.monotonic() - start) * 1000)
+            self._post(self.status.set, f"Handshake OK ({init_latency} ms)")
+            headers = client._h_get()
+            resp = requests.get(client.url, headers=headers, stream=True, verify=client.verify, timeout=client.timeout)
+            self._response = resp
+            ct = (resp.headers.get("Content-Type") or "").lower()
+            if "text/event-stream" not in ct:
+                self._post(self.status.set, f"Kein Event-Stream (HTTP {resp.status_code})")
+                return
+            self._post(self.status.set, "Verbunden – lausche auf Ereignisse …")
+            sse = SSEClient(resp)
+            for ev in sse.events():
+                if self._stop_event.is_set():
+                    break
+                now = time.strftime("%H:%M:%S")
+                data = ev.data.strip()
+                try:
+                    parsed = json.loads(data)
+                    preview = json.dumps(parsed, ensure_ascii=False)
+                except Exception:
+                    preview = data
+                preview = preview[:300]
+                self._post(self._record_event, now, ev.event or "message", preview)
+            self._post(self.status.set, "Verbindung beendet")
+        except Exception as exc:
+            self._post(self.status.set, f"Fehler: {exc}")
+            self._post(self._append_log, f"⚠ {exc}")
+        finally:
+            if self._response is not None:
+                try:
+                    self._response.close()
+                except Exception:
+                    pass
+            if client is not None:
+                try:
+                    if getattr(client, "sid", ""):
+                        client.delete_session()
+                except Exception:
+                    pass
+            self._post(self._set_running, False)
+
+    def _record_event(self, timestamp, event_name, preview):
+        self.event_count.set(self.event_count.get() + 1)
+        self.last_event.set(f"{timestamp} · {event_name}")
+        self._append_log(f"[{timestamp}] {event_name}: {preview}")
+
+
+class TestLabDialog(tk.Toplevel):
+    def __init__(self, gui):
+        super().__init__(gui.root)
+        self.gui = gui
+        self.title("Testlabor")
+        self._thread=None
+        self._closing=False
+        frame=ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Schnelltests für typische Fehlerszenarien").pack(anchor="w")
+        ttk.Label(frame, text="Wähle einen Test. Ergebnisse erscheinen unten und werden zusätzlich im Log aufgezeichnet.", foreground="#555").pack(anchor="w", pady=(0,8))
+
+        btns=ttk.Frame(frame)
+        btns.pack(fill="x", pady=(0,8))
+        ttk.Button(btns, text="Ungültige Argumente senden", command=lambda: self._start("invalid_args")).pack(side="left")
+        ttk.Button(btns, text="Unbekannte Methode testen", command=lambda: self._start("unknown_method")).pack(side="left", padx=(6,0))
+        ttk.Button(btns, text="SSE nach 2s abbrechen", command=lambda: self._start("sse_abort")).pack(side="left", padx=(6,0))
+
+        self.output=ScrolledText(frame, height=14, width=80)
+        self.output.pack(fill="both", expand=True)
+        self.output.configure(state="disabled", font=("Consolas", 10))
+
+        ttk.Button(frame, text="Schließen", command=self._close).pack(pady=(8,0))
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        try:
+            self.transient(gui.root)
+            self.grab_set()
+        except Exception:
+            pass
+
+    def _append(self, text):
+        self.output.configure(state="normal")
+        self.output.insert("end", text+"\n")
+        self.output.see("end")
+        self.output.configure(state="disabled")
+
+    def _start(self, action):
+        if self._thread and self._thread.is_alive():
+            self._append("Bitte warte, aktueller Test läuft noch …")
+            return
+        self._append(f"→ Test gestartet: {action}")
+        self._thread=threading.Thread(target=self._run_action, args=(action,), daemon=True)
+        self._thread.start()
+
+    def _run_action(self, action):
+        try:
+            if action=="invalid_args":
+                self._test_invalid_args()
+            elif action=="unknown_method":
+                self._test_unknown_method()
+            elif action=="sse_abort":
+                self._test_sse_abort()
+        finally:
+            pass
+
+    def _test_invalid_args(self):
+        client=self.gui._create_client(silent=True)
+        try:
+            client.initialize(); client.initialized()
+            tools = (client.list_tools()[0].get("result") or {}).get("tools") or []
+            if not tools:
+                self._append("⚠ Keine Tools vorhanden – Test übersprungen.")
+                return
+            name = tools[0].get("name")
+            self._append(f"Teste Tool '{name}' mit leeren Argumenten …")
+            _, resp = client.call("tools/call", {"name": name, "arguments": {}}, stream=False, sse_max_seconds=5)
+            http = getattr(resp, "status_code", "n/a")
+            self._append(f"Ergebnis HTTP {http}. Details siehe Log.")
+        except Exception as exc:
+            self._append(f"⚠ Fehler: {exc}")
+        finally:
+            try:
+                if getattr(client, "sid", ""):
+                    client.delete_session()
+            except Exception:
+                pass
+
+    def _test_unknown_method(self):
+        client=self.gui._create_client(silent=True)
+        try:
+            client.initialize(); client.initialized()
+            self._append("Frage unbekannte Methode an (sollte Fehler liefern) …")
+            obj, resp = client.call("rpc/does_not_exist", {}, stream=False, accept_json_only=True)
+            http = getattr(resp, "status_code", "n/a")
+            self._append(f"Antwort HTTP {http}: {json.dumps(obj, ensure_ascii=False)[:200]}")
+        except Exception as exc:
+            self._append(f"⚠ Fehler: {exc}")
+        finally:
+            try:
+                if getattr(client, "sid", ""):
+                    client.delete_session()
+            except Exception:
+                pass
+
+    def _test_sse_abort(self):
+        client=self.gui._create_client(silent=True)
+        response=None
+        try:
+            client.initialize(); client.initialized()
+            self._append("SSE-Verbindung wird aufgebaut und nach 2 Sekunden beendet …")
+            headers = client._h_get()
+            response = requests.get(client.url, headers=headers, stream=True, verify=client.verify, timeout=client.timeout)
+            start = time.time()
+            count = 0
+            if (response.headers.get("Content-Type") or "").lower().startswith("text/event-stream"):
+                sse = SSEClient(response)
+                for ev in sse.events():
+                    count += 1
+                    if time.time() - start > 2.0:
+                        break
+            else:
+                self._append(f"⚠ Kein SSE-Stream (HTTP {response.status_code})")
+            self._append(f"Verbindung nach {time.time()-start:.1f}s beendet. Empfangen: {count} Ereignisse.")
+        except Exception as exc:
+            self._append(f"⚠ Fehler: {exc}")
+        finally:
+            try:
+                if response is not None:
+                    response.close()
+            except Exception:
+                pass
+            try:
+                if getattr(client, "sid", ""):
+                    client.delete_session()
+            except Exception:
+                pass
+
+    def _close(self):
+        if self._closing:
+            return
+        self._closing=True
+        try:
+            if self._thread and self._thread.is_alive():
+                self._append("Testlabor schließt – laufender Test wird beendet, bitte kurz warten …")
+                self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self.gui._test_lab = None
+        except Exception:
+            pass
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
     def _cancel(self):
         if self._closing:
             return
