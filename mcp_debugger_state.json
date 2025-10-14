@@ -1,0 +1,13 @@
+{
+  "wizard_done": true,
+  "url": "https://localhost:5000/mcp",
+  "tls_mode": "Embedded CA (./certs/ca.cert.pem)",
+  "timeout": "30",
+  "overall_timeout": "30",
+  "ca": "E:\\-=Entwicklung=-\\-=Git-Sync=-\\mcp-debugger\\certs\\ca.cert.pem",
+  "auth_mode": "None",
+  "auth_token": "",
+  "auth_header": "Authorization",
+  "overall_delay": "200",
+  "audit_delay": "200"
+}
