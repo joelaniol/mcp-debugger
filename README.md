@@ -15,10 +15,19 @@ Read carefully before using.
 MCP Debugger (aka MCP Diagnoser PRO) is a desktop toolkit for exercising HTTP/SSE-based MCP servers end-to-end. It spins up a local Python runtime, launches the GUI, and lets you run targeted or bulk diagnostics against your server implementations, including streaming event sources.
 
 ### Key Features
-- One-click Windows installer script (`setup_and_run.bat`) that provisions a virtual environment, installs dependencies, and starts the GUI.
-- Visual workflows for running individual MCP tool calls, audits, and exporting logs.
-- First-class HTTP + Server-Sent Events diagnostics (stream capture, timeout enforcement, SSE fallback handling).
-- Audit metrics track latency, payload size, and token estimates per tool call.
+### What's new in v4.3
+- Live connection monitor with heartbeat + JSON validation.
+- Kontext-Navigator mit Scrollbar, Tool-Runner und Fehlerhinweisen.
+- Fortschrittsdialog beim "Run all"-Gesamttest, damit die GUI nicht einfriert.
+- Neues Ereignis-Tab und Logfilter mit Suchfeld, Warnungsmodus und Laufnummern.
+- Erweiterte Testlabor-Szenarien (Timeout, große Payload, fehlender Accept-Header).
+
+- One-click Windows installer script (`setup_and_run.bat`) that creates the virtual environment, installs dependencies, and starts the GUI.
+- Guided workflows for individual tool calls, "Run all" audits with progress dialog, and detailed export options (JSON, .http, ZIP report).
+- Live-Verbindung-Monitor (SSE) mit Herzschlag-Überwachung, JSON-Validierung und Event-Log.
+- Kontext-Navigator mit Ebenenübersicht (Handshake, Tools, Prompts, Ressourcen) inkl. direktem Tool-Start und JSON-Details.
+- Ereignistab + Log-Filter (Suchfeld, Warnungsmodus, Laufnummern) für eine schnelle Fehlersuche.
+- Testlabor für typische Fehlerszenarien (ungültige Argumente, unbekannte Methoden, SSE-Abbruch, Mini-Timeout, große Payload, fehlender Accept-Header).
 - Certificate helper (`certgen_ca_server.py`) to create localhost-ready CA and server certificates for TLS testing.
 
 ### Diagnostics Coverage Schema

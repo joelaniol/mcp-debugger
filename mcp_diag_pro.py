@@ -816,7 +816,7 @@ class MCP:
 # ---------------- GUI ----------------
 class ProGUI:
     def __init__(self, root):
-        self.root=root; self.root.title("MCP Diagnoser v4.2")
+        self.root=root; self.root.title("MCP Diagnoser v4.3")
         self.mem_log=[]
         self.q=queue.Queue(); self.client=None; self.last_report=None
         self._audit_stop=False
@@ -3209,7 +3209,7 @@ def run_cli(args):
         c.get_sse(args.sse_seconds)
 
 def main():
-    ap=argparse.ArgumentParser(description="MCP Diagnoser v4.2")
+    ap=argparse.ArgumentParser(description="MCP Diagnoser v4.3")
     sub=ap.add_subparsers(dest="mode")
     p=sub.add_parser("diagnose")
     p.add_argument("--url", required=True)
