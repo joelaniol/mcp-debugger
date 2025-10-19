@@ -1,6 +1,6 @@
 {
   "wizard_done": true,
-  "url": "https://localhost:5000/mcp",
+  "url": "http://127.0.0.1:443/mcp",
   "tls_mode": "Embedded CA (./certs/ca.cert.pem)",
   "timeout": "30",
   "overall_timeout": "30",
@@ -10,5 +10,6 @@
   "auth_header": "Authorization",
   "overall_delay": "200",
   "audit_delay": "200",
-  "auth_enabled": false
+  "auth_enabled": false,
+  "auto_session_renew": true
 }

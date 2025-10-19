@@ -63,7 +63,7 @@ class Sink:
 
 
 class MCP:
-    def __init__(self, url, verify=True, timeout=30.0, extra=None, sink=None, verbose=False):
+    def __init__(self, url, verify=True, timeout=30.0, extra=None, sink=None, verbose=False, auto_session_renew=True, session_retry_limit=3):
         self.url=url; self.verify=verify; self.timeout=timeout
         self.extra=dict(extra or {}); self.sid=""; self.proto=""; self._id=1
         self.sink=sink or Sink()
@@ -74,6 +74,14 @@ class MCP:
         self.last_body = None
         self._id_lock = threading.Lock()
         self._thread_local = threading.local()
+        self.auto_session_renew = bool(auto_session_renew)
+        try:
+            limit=int(session_retry_limit)
+        except (TypeError, ValueError):
+            limit=3
+        self.auto_session_retry_limit=max(0, limit)
+        self._renewing_session = False
+
 
     def _get_session(self):
         """Get or create requests.Session for connection pooling"""
@@ -198,78 +206,199 @@ class MCP:
         return r
 
     def call(self, method, params=None, stream=True, accept_json_only=False, sse_max_seconds=None):
-        payload={"jsonrpc":"2.0","id":self._next(),"method":method}
-        if params is not None: payload["params"]=params
-        h=self._h_post(accept_json_only=accept_json_only)
-        self.last_request={"method":method,"headers":h,"payload":payload}
-        self.last_http={"method":"POST","url":self.url,"headers":h.copy(),"body":payload}
-        snapshot = self.last_request.copy() if isinstance(self.last_request, dict) else self.last_request
-        try:
-            self._thread_local.last_request = snapshot
-        except Exception:
-            self._thread_local.last_request = snapshot
-        self.sink.write(f">> POST {self.url} [{method}]"); self._log_h(h)
-        self.sink.write(">> Body: " + json.dumps(payload, ensure_ascii=False))
-        if self.sid: self.sink.write(f">> Using session: {self.sid}")
-        r=self._get_session().post(self.url, data=json.dumps(payload), headers=h, stream=stream, verify=self.verify, timeout=self.timeout)
-        try:
-            request_info = copy.deepcopy(getattr(self._thread_local, 'last_request', self.last_request))
-        except Exception:
-            request_info = getattr(self._thread_local, 'last_request', self.last_request)
-        try:
-            r._mcp_request_info = copy.deepcopy(request_info)
-        except Exception:
-            r._mcp_request_info = request_info
-        self.sink.write(f"<< HTTP {r.status_code}  Content-Type: {r.headers.get('Content-Type','')}")
-        ct=(r.headers.get("Content-Type") or "").lower()
-
-        # If server unexpectedly returns SSE but we explicitly asked JSON-only or stream=False, don't block
-        if "text/event-stream" in ct and (accept_json_only or not stream):
-            self.sink.write("<< WARN: Unexpected text/event-stream for non-stream call; parsing first event.")
+        max_attempts = 1 + (self.auto_session_retry_limit if self.auto_session_renew else 0)
+        attempt = 0
+        last_obj = None
+        last_response = None
+        while attempt < max_attempts:
+            attempt += 1
+            payload={"jsonrpc":"2.0","id":self._next(),"method":method}
+            if params is not None:
+                payload["params"]=params
+            h=self._h_post(accept_json_only=accept_json_only)
+            self.last_request={"method":method,"headers":h,"payload":payload}
+            self.last_http={"method":"POST","url":self.url,"headers":h.copy(),"body":payload}
+            snapshot = self.last_request.copy() if isinstance(self.last_request, dict) else self.last_request
             try:
-                client = SSEClient(r)
-                event_obj = None
+                self._thread_local.last_request = snapshot
+            except Exception:
+                self._thread_local.last_request = snapshot
+            self.sink.write(f">> POST {self.url} [{method}]"); self._log_h(h)
+            self.sink.write(">> Body: " + json.dumps(payload, ensure_ascii=False))
+            if self.sid:
+                self.sink.write(f">> Using session: {self.sid}")
+            r=self._get_session().post(self.url, data=json.dumps(payload), headers=h, stream=stream, verify=self.verify, timeout=self.timeout)
+            try:
+                request_info = copy.deepcopy(getattr(self._thread_local, 'last_request', self.last_request))
+            except Exception:
+                request_info = getattr(self._thread_local, 'last_request', self.last_request)
+            try:
+                r._mcp_request_info = copy.deepcopy(request_info)
+            except Exception:
+                r._mcp_request_info = request_info
+            self.sink.write(f"<< HTTP {r.status_code}  Content-Type: {r.headers.get('Content-Type','')}")
+            ct=(r.headers.get("Content-Type") or "").lower()
+
+            obj = None
+            if "text/event-stream" in ct and (accept_json_only or not stream):
+                self.sink.write("<< WARN: Unexpected text/event-stream for non-stream call; parsing first event.")
+                try:
+                    client = SSEClient(r)
+                    event_obj = None
+                    for ev in client.events():
+                        try:
+                            data = json.loads(ev.data)
+                            event_obj = data
+                            break
+                        except Exception:
+                            self.sink.write(f"<< [SSE raw] {ev.data}")
+                    if event_obj is None:
+                        try:
+                            raw = r.text
+                        except Exception:
+                            raw = "<streaming>"
+                        obj={"_raw": raw, "_note":"unexpected event-stream for non-stream/json-only call"}
+                    else:
+                        obj=event_obj
+                except Exception as exc:
+                    self.sink.write(f"<< WARN: Failed to parse SSE fallback: {exc}")
+                    try:
+                        raw = r.text
+                    except Exception:
+                        raw = "<streaming>"
+                    obj={"_raw": raw, "_note":"unexpected event-stream for non-stream/json-only call"}
+                self.last_body=obj
+                self.sink.write("<< Body: " + json.dumps(obj, ensure_ascii=False))
+            elif "text/event-stream" in ct:
+                client=SSEClient(r)
+                deadline = time.monotonic() + (sse_max_seconds or 30)
+                matched=None
                 for ev in client.events():
                     try:
-                        data = json.loads(ev.data)
-                        event_obj = data
-                        break
+                        d=json.loads(ev.data)
+                        self.last_body=d
+                        self.sink.write(f"<< [SSE {ev.event or 'message'}] " + json.dumps(d, ensure_ascii=False))
+                        if isinstance(d,dict) and d.get("id")==payload["id"] and ("result" in d or "error" in d):
+                            matched=d
+                            break
                     except Exception:
                         self.sink.write(f"<< [SSE raw] {ev.data}")
-                if event_obj is None:
-                    obj={"_raw": r.text, "_note":"event-stream without parsable JSON"}
+                    if time.monotonic() >= deadline:
+                        self.sink.write("<< WARN: SSE read timed out; continuing.")
+                        break
+                if matched is None:
+                    obj={}
+                    self.last_body=obj
                 else:
-                    obj=event_obj
-            except Exception as exc:
-                self.sink.write(f"<< WARN: Failed to parse SSE fallback: {exc}")
+                    obj=matched
+            else:
                 try:
-                    raw = r.text
+                    obj=r.json()
                 except Exception:
-                    raw = "<streaming>"
-                obj={"_raw": raw, "_note":"unexpected event-stream for non-stream/json-only call"}
-            self.last_body=obj
-            return obj, r
+                    obj={"_raw": r.text}
+                self.last_body = obj
+                self.sink.write("<< Body: " + json.dumps(obj, ensure_ascii=False))
 
-        if "text/event-stream" in ct:
-            client=SSEClient(r)
-            deadline = time.monotonic() + (sse_max_seconds or 30)
-            for ev in client.events():
-                try:
-                    d=json.loads(ev.data); self.last_body=d; self.sink.write(f"<< [SSE {ev.event or 'message'}] " + json.dumps(d, ensure_ascii=False))
-                    if isinstance(d,dict) and d.get("id")==payload["id"] and ("result" in d or "error" in d):
-                        return d, r
-                except Exception:
-                    self.sink.write(f"<< [SSE raw] {ev.data}")
-                if time.monotonic() >= deadline:
-                    self.sink.write("<< WARN: SSE read timed out; continuing.")
-                    break
-            return {}, r
-        else:
-            try: obj=r.json()
-            except Exception: obj={"_raw": r.text}
-            self.last_body = obj
-            self.sink.write("<< Body: " + json.dumps(obj, ensure_ascii=False))
+            last_obj, last_response = obj, r
+            retry_reason = self._detect_session_expired(obj, r, is_stream="text/event-stream" in ct)
+            if self.auto_session_renew and retry_reason:
+                if attempt < max_attempts and self._auto_renew_session(attempt, max_attempts, retry_reason):
+                    continue
+                if attempt >= max_attempts:
+                    self.sink.write(f"<< WARN: Session auto-renew skipped; retry limit ({self.auto_session_retry_limit}) reached.")
+                return obj, r
             return obj, r
+        return last_obj, last_response
+
+    def _detect_session_expired(self, obj, response, is_stream=False):
+        status = None
+        try:
+            status = getattr(response, "status_code", None)
+        except Exception:
+            status = None
+        headers = {}
+        if response is not None:
+            try:
+                headers = dict(response.headers)
+            except Exception:
+                headers = {}
+        text_fragments = []
+        if isinstance(obj, dict):
+            try:
+                text_fragments.append(json.dumps(obj, ensure_ascii=False).lower())
+            except Exception:
+                text_fragments.append(str(obj).lower())
+        elif isinstance(obj, str):
+            text_fragments.append(obj.lower())
+        elif obj is not None:
+            text_fragments.append(str(obj).lower())
+        if response is not None and not is_stream:
+            try:
+                text_fragments.append(response.text.lower())
+            except Exception:
+                pass
+        combined = " ".join(fragment for fragment in text_fragments if fragment)
+        header_candidates=("Mcp-Session-Status","X-Session-Status","X-Mcp-Session")
+        for key in header_candidates:
+            value = headers.get(key)
+            if value and "expire" in value.lower():
+                return f"{key}: {value}"
+        if status in (440, 419):
+            return f"HTTP {status} indicates session timeout"
+        if status in (401, 403) and "session" in combined:
+            return f"HTTP {status} with session error message"
+        if status is not None and 400 <= status < 500 and "session" in combined:
+            return f"HTTP {status} indicates session problem"
+        keywords=(
+            "session expired",
+            "session has expired",
+            "invalid session",
+            "session invalid",
+            "session reset",
+            "session terminated",
+            "session not found",
+            "session missing",
+            "session abgelaufen",
+            "session ist abgelaufen",
+            "session timed out",
+            "session timeout",
+            "session abgel.",
+            "mcp session expired",
+        )
+        for kw in keywords:
+            if kw in combined:
+                return f"Server reported '{kw}'"
+        return None
+
+    def _auto_renew_session(self, attempt, max_attempts, reason):
+        if self._renewing_session:
+            self.sink.write("<< WARN: Session auto-renew already in progress; skipping additional request.")
+            return False
+        retry_max = max(1, max_attempts - 1)
+        retry_no = min(attempt, retry_max)
+        self._renewing_session = True
+        try:
+            self.sink.write(f"<< WARN: {reason}. Auto session renew attempt {retry_no}/{retry_max}.")
+            try:
+                if self._session is not None:
+                    self._session.close()
+            except Exception:
+                pass
+            self._session = None
+            self.sid=""
+            self.initialize()
+            try:
+                self.initialized()
+            except Exception as exc:
+                self.sink.write(f"<< WARN: notifications/initialized during auto-renew failed: {exc}")
+            else:
+                self.sink.write("<< INFO: Session auto-renew completed.")
+            return True
+        except Exception as exc:
+            self.sink.write(f"<< WARN: Session auto-renew failed: {exc}")
+            return False
+        finally:
+            self._renewing_session = False
 
     def list_tools(self): return self.call("tools/list", {"cursor": None}, sse_max_seconds=5)
     def list_resources(self): return self.call("resources/list", {"cursor": None}, sse_max_seconds=5)
@@ -1026,13 +1155,33 @@ class MCP:
 
             # 4. Check for modern capabilities (-10 points each)
             caps = (details.get("initialize", {}).get("body", {}).get("result", {}).get("capabilities") or {})
+            def _caps_contains(fragment, obj):
+                fragment = fragment.lower()
+                if isinstance(obj, dict):
+                    for key, value in obj.items():
+                        if fragment in str(key).lower():
+                            return True
+                        if _caps_contains(fragment, value):
+                            return True
+                elif isinstance(obj, (list, tuple, set)):
+                    for item in obj:
+                        if _caps_contains(fragment, item):
+                            return True
+                elif isinstance(obj, str):
+                    if fragment in obj.lower():
+                        return True
+                return False
             if isinstance(caps, dict):
-                # Check for OAuth/Auth support (added in 2025-03-26)
-                if not caps.get("auth") and not caps.get("authorization"):
+                auth_present = bool(caps.get("auth") or caps.get("authorization"))
+                if not auth_present and caps.get("experimental"):
+                    auth_present = _caps_contains("auth", caps.get("experimental"))
+                if not auth_present:
                     modernization_issues.append("No auth/authorization capability advertised")
                     modernization_score -= 10
-                # Check for structured outputs (added in newer specs)
-                if not caps.get("structuredOutputs"):
+                structured_present = bool(caps.get("structuredOutputs"))
+                if not structured_present:
+                    structured_present = _caps_contains("structured", caps)
+                if not structured_present:
                     modernization_issues.append("No structured outputs support")
                     modernization_score -= 10
 
@@ -1066,6 +1215,10 @@ class MCP:
 class ProGUI:
     def __init__(self, root):
         self.root=root; self.root.title("MCP Diagnoser v4.3")
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+        except Exception:
+            pass
         self.mem_log=[]
         self.q=queue.Queue(); self.client=None; self.last_report=None
         self._audit_stop=False
@@ -1091,6 +1244,7 @@ class ProGUI:
             "auth_token":"",
             "auth_header":"Authorization",
             "auth_enabled":False,
+            "auto_session_renew":True,
         }
         merged={k:self._state.get(k, v) for k,v in state_defaults.items()}
         self.url=tk.StringVar(value=merged["url"])
@@ -1104,6 +1258,7 @@ class ProGUI:
         self.auth_mode=tk.StringVar(value=merged["auth_mode"])
         self.auth_token=tk.StringVar(value=merged["auth_token"])
         self.auth_header=tk.StringVar(value=merged["auth_header"])
+        self.auto_session=tk.BooleanVar(value=bool(merged.get("auto_session_renew", True)))
         default_enabled = bool(merged["auth_mode"] != "None" and merged["auth_token"])
         enabled_val = self._state.get("auth_enabled", default_enabled)
         self.auth_enabled=tk.BooleanVar(value=bool(enabled_val if enabled_val is not None else default_enabled))
@@ -1119,6 +1274,9 @@ class ProGUI:
         self._audit_timelines={}
         self._audit_call_items={}
         self._overall_progress_dialog=None
+        self._overall_current_stage=""
+        self._overall_wait_job=None
+        self._overall_wait_tick=0
         self.summary_detail_map={}
         self.summary_data_map={}
         self.log_filter=tk.StringVar(value="")
@@ -1270,6 +1428,7 @@ class ProGUI:
         ttk.Button(top, textvariable=self.auth_toggle_text, command=self._toggle_auth, width=14).grid(row=2, column=4, sticky="w", padx=(0,4))
         ttk.Button(top, text="Authentifizierungsmanager...", command=self._open_token_manager).grid(row=2, column=5, sticky="w")
         ttk.Label(top, text="Konfiguration und Token im Authentifizierungsmanager pflegen.", foreground="#555").grid(row=3, column=1, columnspan=5, sticky="w", pady=(2,0))
+        ttk.Checkbutton(top, text="Session automatisch erneuern", variable=self.auto_session, command=self._save_settings).grid(row=4, column=1, columnspan=3, sticky="w", pady=(4,0))
 
         prof=ttk.Frame(self.root); prof.pack(fill="x", **p)
         ttk.Label(prof, text="Profiles:").pack(side="left")
@@ -1549,8 +1708,14 @@ class ProGUI:
             "auth_token": self.auth_token.get(),
             "auth_header": self.auth_header.get(),
             "auth_enabled": bool(self.auth_enabled.get()),
+            "auto_session_renew": bool(self.auto_session.get()),
         }
         self._state.update(updates)
+        if self.client is not None:
+            try:
+                self.client.auto_session_renew = bool(self.auto_session.get())
+            except Exception:
+                pass
         self._save_state()
         connection_changed=any(previous.get(k)!=updates.get(k) for k in critical_keys)
         if connection_changed:
@@ -1558,6 +1723,16 @@ class ProGUI:
             self._sink("Settings saved. Connection parameters changed; session will be recreated.")
         else:
             self._sink("Settings saved.")
+
+    def _on_window_close(self):
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def _profiles_path(self): return os.path.join(os.path.dirname(__file__), "auth_profiles.json")
     def _load_profiles_file(self):
@@ -1922,7 +2097,7 @@ class ProGUI:
             sink = QuietSink(gui_cb=None, mem_log=[])
         else:
             sink = Sink(self._sink, self.mem_log)
-        return MCP(url, verify=verify, timeout=to, extra=extra, sink=sink, verbose=False)
+        return MCP(url, verify=verify, timeout=to, extra=extra, sink=sink, verbose=False, auto_session_renew=bool(self.auto_session.get()))
 
     def _build_client(self, reset=False, extra_override=None):
         if reset or self.client is None:
@@ -1957,7 +2132,7 @@ class ProGUI:
         try: delay_ms=float(self.overall_delay.get() or "0")
         except: delay_ms=0.0
         step_delay=max(0.0, delay_ms/1000.0)
-        self.summary_status.set("Overall-Test l\u00e4uft ...")
+        self.summary_status.set("Overall-Test laeuft ...")
 
         # Stop flag for cancellation
         self._overall_stop_flag = False
@@ -1968,16 +2143,17 @@ class ProGUI:
 
         dlg = ProgressDialog(self.root, "Gesamttest", "Vorbereitung ...", cancelable=True, on_cancel=on_cancel, modal=False)
         self._overall_progress_dialog = dlg
+        self._overall_current_stage = ""
+        self._overall_wait_tick = 0
+        self._cancel_overall_wait_animation()
 
         def stage_cb(stage):
             def _set():
                 if stage:
                     self.summary_status.set(f"Aktuell: {stage}")
                 else:
-                    self.summary_status.set("Aktuell: - ")
-                current = getattr(self, "_overall_progress_dialog", None)
-                if current:
-                    current.update_message(f"Schritt: {stage}" if stage else "Gesamttest l\u00e4uft ...")
+                    self.summary_status.set("Aktuell: -")
+                self._set_overall_stage(stage)
             try:
                 self.root.after(0, _set)
             except Exception:
@@ -2007,6 +2183,7 @@ class ProGUI:
                 else:
                     self.summary.insert("", "end", values=("Keine Ergebnisse", "", "", ""))
                 self.summary_status.set(status_msg)
+                self._cancel_overall_wait_animation()
                 current = getattr(self, "_overall_progress_dialog", None)
                 if current:
                     current.close()
@@ -2014,6 +2191,56 @@ class ProGUI:
                 self._overall_stop_flag = False
             self.root.after(0, _finalize)
         threading.Thread(target=run, daemon=True).start()
+
+    def _cancel_overall_wait_animation(self):
+        job = getattr(self, "_overall_wait_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._overall_wait_job=None
+
+    def _start_overall_wait_animation(self):
+        self._cancel_overall_wait_animation()
+        if not self._overall_current_stage:
+            return
+        def tick():
+            current = getattr(self, "_overall_progress_dialog", None)
+            if not current or not self._overall_current_stage:
+                self._overall_wait_job=None
+                return
+            self._overall_wait_tick = (self._overall_wait_tick + 1) % 3
+            dots = "." * (self._overall_wait_tick + 1)
+            try:
+                current.update_message(f"Schritt: {self._overall_current_stage} (warte{dots})")
+            except Exception:
+                pass
+            try:
+                self._overall_wait_job = self.root.after(450, tick)
+            except Exception:
+                self._overall_wait_job=None
+        tick()
+
+    def _set_overall_stage(self, stage_label):
+        current = getattr(self, "_overall_progress_dialog", None)
+        if stage_label:
+            self._overall_current_stage = stage_label
+            self._overall_wait_tick = -1
+            if current:
+                try:
+                    current.update_message(f"Schritt: {stage_label}")
+                except Exception:
+                    pass
+            self._start_overall_wait_animation()
+        else:
+            self._overall_current_stage = ""
+            self._cancel_overall_wait_animation()
+            if current:
+                try:
+                    current.update_message("Gesamttest laeuft ...")
+                except Exception:
+                    pass
 
     def _run_all(self):
         self._start_overall(reset_session=True)
@@ -2157,6 +2384,15 @@ class ProGUI:
             self.audit_progress.set("Stop requested")
 
     def _run_audit(self):
+        confirmed = True
+        if messagebox is not None:
+            try:
+                confirmed = messagebox.askokcancel("Warnung", "\u26a0 Run audit f\u00fchrt alle verf\u00fcgbaren Tools aus. Sicher fortfahren?", icon="warning", default='cancel', parent=getattr(self, 'root', None))
+            except Exception:
+                confirmed = True
+        if not confirmed:
+            self._sink("Run audit abgebrochen durch Benutzer.")
+            return
         for i in self.audit.get_children(): self.audit.delete(i)
         self._audit_row_data = {}
         self._audit_timelines = {}
