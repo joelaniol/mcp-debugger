@@ -1271,6 +1271,8 @@ class ProGUI:
         self._sse_monitor=None
         self._test_lab=None
         self._context_layers=None
+        self._input_methods_dialog=None
+        self._resources_dialog=None
         self._audit_timelines={}
         self._audit_call_items={}
         self._overall_progress_dialog=None
@@ -1438,6 +1440,8 @@ class ProGUI:
         ttk.Button(prof, text="MCP Info", command=self._show_mcp_info).pack(side="left", padx=(6,0))
         ttk.Button(prof, text="Live-Verbindung", command=self._open_sse_monitor).pack(side="left", padx=(6,0))
         ttk.Button(prof, text="Kontext-Navigator...", command=self._open_context_layers).pack(side="left", padx=(6,0))
+        ttk.Button(prof, text="Input-Methoden...", command=self._show_input_methods).pack(side="left", padx=(6,0))
+        ttk.Button(prof, text="Ressourcen-Browser...", command=self._open_resource_browser).pack(side="left", padx=(6,0))
         ttk.Button(prof, text="Testlabor...", command=self._open_test_lab).pack(side="left", padx=(6,0))
         ttk.Label(prof, text="\u26a0 Token wird lokal im Klartext gespeichert. Nur auf vertrauensw\u00fcrdigen Ger\u00e4ten.").pack(side="left")
 
@@ -1940,6 +1944,297 @@ class ProGUI:
             info = self._collect_mcp_info()
             self.root.after(0, lambda: self._present_mcp_info(info))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_input_methods(self):
+        if tk is None:
+            self._sink("Input-Methoden-Ansicht nicht verfuegbar (Tkinter fehlt).")
+            return
+        existing = getattr(self, "_input_methods_dialog", None)
+        if existing and str(existing) and existing.winfo_exists():
+            try:
+                existing.lift()
+                existing.focus_force()
+            except Exception:
+                pass
+            return
+        self._sink("Input-Methoden werden gesammelt ...")
+        def worker():
+            data = self._collect_input_methods()
+            self.root.after(0, lambda: self._present_input_methods(data))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _collect_input_methods(self):
+        result={"methods":[], "errors":[]}
+        client=self._create_client(silent=True)
+        try:
+            obj, _ = client.initialize()
+            caps=(obj.get("result") or {}).get("capabilities") if isinstance(obj, dict) else {}
+            if isinstance(caps, dict):
+                result["methods"]=self._extract_input_methods(caps)
+            else:
+                result["errors"].append("Capabilities nicht verfuegbar")
+        except Exception as exc:
+            result["errors"].append(str(exc))
+        finally:
+            try:
+                if getattr(client, "sid", ""):
+                    client.delete_session()
+            except Exception:
+                pass
+        return result
+
+    def _extract_input_methods(self, caps):
+        methods=[]
+        def walk(node, path):
+            if isinstance(node, dict):
+                name="::".join(path) if path else "root"
+                modes=node.get("modes")
+                transport=node.get("transport")
+                allow=node.get("allowAnonymous")
+                tokens=node.get("tokensConfigured")
+                if isinstance(modes, (list, tuple)):
+                    methods.append({
+                        "name": name,
+                        "transport": transport,
+                        "modes": ", ".join(str(m) for m in modes),
+                        "allowAnonymous": allow,
+                        "tokensConfigured": tokens,
+                    })
+                for key, value in node.items():
+                    walk(value, path+[str(key)])
+            elif isinstance(node, (list, tuple)):
+                for idx, item in enumerate(node):
+                    walk(item, path+[str(idx)])
+        walk(caps, [])
+        unique={}
+        for method in methods:
+            unique_key=(method["name"], method["transport"], method["modes"])
+            unique[unique_key]=method
+        return list(unique.values())
+
+    def _present_input_methods(self, data):
+        methods=data.get("methods") or []
+        errors=data.get("errors") or []
+        if tk is None:
+            self._sink("Input-Methoden: " + ("keine" if not methods else str(methods)))
+            return
+        if not methods and errors:
+            if messagebox:
+                try:
+                    messagebox.showwarning("Input-Methoden", "Keine Input-Methoden gefunden: " + "; ".join(errors))
+                except Exception:
+                    pass
+            else:
+                self._sink("Input-Methoden: " + "; ".join(errors))
+            return
+        top=tk.Toplevel(self.root)
+        top.title("Input-Methoden")
+        self._input_methods_dialog=top
+        def on_close():
+            try:
+                top.destroy()
+            finally:
+                self._input_methods_dialog=None
+        top.protocol("WM_DELETE_WINDOW", on_close)
+        try:
+            top.transient(self.root)
+        except Exception:
+            pass
+        frame=ttk.Frame(top); frame.pack(fill="both", expand=True, padx=10, pady=10)
+        ttk.Label(frame, text="Bekannte Eingabemethoden", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        columns=("name","transport","modes","anonymous","tokens")
+        tree=ttk.Treeview(frame, columns=columns, show="headings", height=8)
+        tree.heading("name", text="Name")
+        tree.heading("transport", text="Transport")
+        tree.heading("modes", text="Modi")
+        tree.heading("anonymous", text="Allow anonymous")
+        tree.heading("tokens", text="Tokens konfiguriert")
+        tree.column("name", width=220, anchor="w")
+        tree.column("transport", width=120, anchor="center")
+        tree.column("modes", width=200, anchor="w")
+        tree.column("anonymous", width=130, anchor="center")
+        tree.column("tokens", width=140, anchor="center")
+        tree.pack(fill="both", expand=True, pady=(6,6))
+        for method in methods:
+            tree.insert("", "end", values=(
+                method.get("name",""),
+                method.get("transport",""),
+                method.get("modes",""),
+                str(method.get("allowAnonymous")),
+                str(method.get("tokensConfigured")),
+            ))
+        if errors:
+            err_label=ttk.Label(frame, text="Hinweise: " + "; ".join(errors), foreground="#B00020", wraplength=480, justify="left")
+            err_label.pack(fill="x", pady=(4,0))
+        ttk.Button(frame, text="Schliessen", command=on_close).pack(pady=(6,0), anchor="e")
+
+    def _open_resource_browser(self):
+        if tk is None:
+            self._sink("Ressourcen-Browser nicht verfuegbar (Tkinter fehlt).")
+            return
+        existing = getattr(self, "_resources_dialog", None)
+        if existing and str(existing) and existing.winfo_exists():
+            try:
+                existing.lift()
+                existing.focus_force()
+            except Exception:
+                pass
+            return
+        self._sink("Ressourcen werden gesammelt ...")
+        def worker():
+            data = self._collect_resource_list()
+            self.root.after(0, lambda: self._present_resource_browser(data))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _collect_resource_list(self):
+        result={"items":[], "errors":[]}
+        client=self._create_client(silent=True)
+        try:
+            client.initialize(); client.initialized()
+            obj, resp = client.list_resources()
+            resources = (obj.get("result") or {}).get("resources") if isinstance(obj, dict) else []
+            if isinstance(resources, list):
+                for entry in resources:
+                    if not isinstance(entry, dict):
+                        continue
+                    result["items"].append({
+                        "name": entry.get("name") or entry.get("uri") or "(ohne Name)",
+                        "uri": entry.get("uri"),
+                        "mimeType": entry.get("mimeType"),
+                        "description": entry.get("description"),
+                    })
+            result["http_status"] = getattr(resp, "status_code", None)
+        except Exception as exc:
+            result["errors"].append(str(exc))
+        finally:
+            try:
+                if getattr(client, "sid", ""):
+                    client.delete_session()
+            except Exception:
+                pass
+        return result
+
+    def _read_resource_content(self, uri):
+        result={"uri":uri, "content":None, "errors":[]}
+        if not uri:
+            result["errors"].append("Keine URI angegeben")
+            return result
+        client=self._create_client(silent=True)
+        try:
+            client.initialize(); client.initialized()
+            params={"uris":[uri]}
+            obj, _ = client.call("resources/read", params, stream=False, sse_max_seconds=10)
+            contents = (obj.get("result") or {}).get("contents") if isinstance(obj, dict) else None
+            if isinstance(contents, list) and contents:
+                first = contents[0]
+                if isinstance(first, dict):
+                    if first.get("text") is not None:
+                        result["content"] = str(first.get("text"))
+                    elif first.get("bytes") is not None:
+                        result["content"] = "<binary content>"
+                    else:
+                        result["content"] = json.dumps(first, ensure_ascii=False, indent=2)
+                else:
+                    result["content"] = str(first)
+            else:
+                result["content"] = "<keine Daten>"
+        except Exception as exc:
+            result["errors"].append(str(exc))
+        finally:
+            try:
+                if getattr(client, "sid", ""):
+                    client.delete_session()
+            except Exception:
+                pass
+        return result
+
+    def _present_resource_browser(self, data):
+        if tk is None:
+            items=data.get("items") or []
+            self._sink(f"Ressourcen: {len(items)} gefunden")
+            return
+        dialog=getattr(self, "_resources_dialog", None)
+        if dialog and str(dialog) and dialog.winfo_exists():
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+            self._resources_dialog=None
+        top=tk.Toplevel(self.root)
+        top.title("Ressourcen-Browser")
+        self._resources_dialog=top
+        def on_close():
+            try:
+                top.destroy()
+            finally:
+                self._resources_dialog=None
+        top.protocol("WM_DELETE_WINDOW", on_close)
+        try:
+            top.geometry("900x500")
+            top.transient(self.root)
+        except Exception:
+            pass
+        container=ttk.Frame(top)
+        container.pack(fill="both", expand=True, padx=10, pady=10)
+        splitter=ttk.PanedWindow(container, orient="horizontal")
+        splitter.pack(fill="both", expand=True)
+        left_frame=ttk.Frame(splitter)
+        right_frame=ttk.Frame(splitter)
+        splitter.add(left_frame, weight=1)
+        splitter.add(right_frame, weight=2)
+        columns=("name","uri","mime")
+        tree=ttk.Treeview(left_frame, columns=columns, show="headings", height=15)
+        tree.heading("name", text="Name")
+        tree.heading("uri", text="URI")
+        tree.heading("mime", text="MIME-Type")
+        tree.column("name", width=220, anchor="w")
+        tree.column("uri", width=280, anchor="w")
+        tree.column("mime", width=140, anchor="center")
+        tree.pack(fill="both", expand=True)
+        scrollbar=ttk.Scrollbar(left_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        text_widget=ScrolledText(right_frame, wrap="word")
+        text_widget.pack(fill="both", expand=True)
+        status_label=ttk.Label(right_frame, text="Bitte Ressource waehlen", foreground="#444")
+        status_label.pack(fill="x", pady=(6,0))
+        items=data.get("items") or []
+        for entry in items:
+            tree.insert("", "end", values=(entry.get("name",""), entry.get("uri",""), entry.get("mimeType","")))
+        errors=data.get("errors") or []
+        if errors:
+            status_label.configure(text="Hinweise: " + "; ".join(errors), foreground="#B00020")
+        def load_resource(event=None):
+            selection=tree.selection()
+            if not selection:
+                return
+            item_id=selection[0]
+            uri=tree.item(item_id, "values")[1]
+            status_label.configure(text=f"Lade Ressource: {uri}", foreground="#444")
+            text_widget.configure(state="normal")
+            text_widget.delete("1.0","end")
+            text_widget.insert("end", "Lade ...")
+            text_widget.configure(state="disabled")
+            def worker():
+                info=self._read_resource_content(uri)
+                def update():
+                    content=info.get("content") or "<keine Daten>"
+                    text_widget.configure(state="normal")
+                    text_widget.delete("1.0","end")
+                    text_widget.insert("end", content)
+                    text_widget.configure(state="disabled")
+                    errs=info.get("errors") or []
+                    if errs:
+                        status_label.configure(text="; ".join(errs), foreground="#B00020")
+                    else:
+                        status_label.configure(text=f"Ressource: {uri}", foreground="#444")
+                try:
+                    self.root.after(0, update)
+                except Exception:
+                    pass
+            threading.Thread(target=worker, daemon=True).start()
+        tree.bind("<<TreeviewSelect>>", load_resource)
+        ttk.Button(container, text="Schliessen", command=on_close).pack(pady=(8,0), anchor="e")
 
     def _collect_context_layers(self):
         info={"errors":[], "layers":[]}
