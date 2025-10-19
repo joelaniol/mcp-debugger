@@ -23,6 +23,8 @@ MCP Debugger (aka MCP Diagnoser PRO) is a desktop toolkit for exercising HTTP/SS
 - Fortschrittsdialog beim "Run all"-Gesamttest, damit die GUI nicht einfriert.
 - Neues Ereignis-Tab und Logfilter mit Suchfeld, Warnungsmodus und Laufnummern.
 - Erweiterte Testlabor-Szenarien (Timeout, große Payload, fehlender Accept-Header).
+- Neue Eingabemethoden-Ansicht zeigt verfügbare Auth/Input-Kanäle aus den Capabilities.
+- Ressourcen-Browser inkl. Inhaltsanzeige und Formatvalidierung (JSON/YAML/Markdown).
 
 - One-click Windows installer script (`setup_and_run.bat`) that creates the virtual environment, installs dependencies, and starts the GUI.
 - Guided workflows for individual tool calls, "Run all" audits with progress dialog, and detailed export options (JSON, .http, ZIP report).
@@ -30,6 +32,10 @@ MCP Debugger (aka MCP Diagnoser PRO) is a desktop toolkit for exercising HTTP/SS
 - Kontext-Navigator mit Ebenenübersicht (Handshake, Tools, Prompts, Ressourcen) inkl. direktem Tool-Start und JSON-Details.
 - Ereignistab + Log-Filter (Suchfeld, Warnungsmodus, Laufnummern) für eine schnelle Fehlersuche.
 - Testlabor für typische Fehlerszenarien (ungültige Argumente, unbekannte Methoden, SSE-Abbruch, Mini-Timeout, große Payload, fehlender Accept-Header).
+
+#### Input & Resource Utilities
+- **Input Methods** viewer surfaces authentication/input capabilities (including experimental entries) so you can inspect available channels before triggering tools.
+- **Resource Browser** lists `resources/list` entries, fetches contents via `resources/read`, and lets you validate JSON/YAML/Markdown payloads with one click.
 - Certificate helper (`certgen_ca_server.py`) to create localhost-ready CA and server certificates for TLS testing.
 
 ### Diagnostics Coverage Schema

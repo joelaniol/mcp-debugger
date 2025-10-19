@@ -1273,6 +1273,7 @@ class ProGUI:
         self._context_layers=None
         self._input_methods_dialog=None
         self._resources_dialog=None
+        self._resource_cache={}
         self._audit_timelines={}
         self._audit_call_items={}
         self._overall_progress_dialog=None
@@ -2027,6 +2028,7 @@ class ProGUI:
             else:
                 self._sink("Input-Methoden: " + "; ".join(errors))
             return
+        self._resource_cache.clear()
         top=tk.Toplevel(self.root)
         top.title("Input-Methoden")
         self._input_methods_dialog=top
@@ -2120,10 +2122,23 @@ class ProGUI:
             result["errors"].append("Keine URI angegeben")
             return result
         client=self._create_client(silent=True)
+        def _invalid_params(obj):
+            return isinstance(obj, dict) and isinstance(obj.get("error"), dict) and obj["error"].get("code")==-32602
         try:
             client.initialize(); client.initialized()
             params={"uris":[uri]}
-            obj, _ = client.call("resources/read", params, stream=False, sse_max_seconds=10)
+            obj, _ = client.call("resources/read", params, stream=False, accept_json_only=True, sse_max_seconds=10)
+            if _invalid_params(obj):
+                params={"uris":[{"uri": uri}]}
+                obj, _ = client.call("resources/read", params, stream=False, accept_json_only=True, sse_max_seconds=10)
+            if isinstance(obj, dict) and isinstance(obj.get("error"), dict):
+                err=obj["error"].get("message") or str(obj["error"])
+                result["errors"].append(err)
+                try:
+                    result["content"]=json.dumps(obj, ensure_ascii=False, indent=2)
+                except Exception:
+                    result["content"]=str(obj)
+                return result
             contents = (obj.get("result") or {}).get("contents") if isinstance(obj, dict) else None
             if isinstance(contents, list) and contents:
                 first = contents[0]
@@ -2167,11 +2182,14 @@ class ProGUI:
         top=tk.Toplevel(self.root)
         top.title("Ressourcen-Browser")
         self._resources_dialog=top
+        self._resource_cache.clear()
+
         def on_close():
             try:
                 top.destroy()
             finally:
                 self._resources_dialog=None
+
         top.protocol("WM_DELETE_WINDOW", on_close)
         try:
             top.geometry("900x500")
@@ -2208,17 +2226,21 @@ class ProGUI:
         errors=data.get("errors") or []
         if errors:
             status_label.configure(text="Hinweise: " + "; ".join(errors), foreground="#B00020")
+
         def load_resource(event=None):
             selection=tree.selection()
             if not selection:
                 return
             item_id=selection[0]
-            uri=tree.item(item_id, "values")[1]
+            values=tree.item(item_id, "values")
+            uri=values[1]
+            mime_value=values[2]
             status_label.configure(text=f"Lade Ressource: {uri}", foreground="#444")
             text_widget.configure(state="normal")
             text_widget.delete("1.0","end")
             text_widget.insert("end", "Lade ...")
             text_widget.configure(state="disabled")
+
             def worker():
                 info=self._read_resource_content(uri)
                 def update():
@@ -2228,6 +2250,7 @@ class ProGUI:
                     text_widget.insert("end", content)
                     text_widget.configure(state="disabled")
                     errs=info.get("errors") or []
+                    self._resource_cache[uri]={"content":content, "mime":mime_value}
                     if errs:
                         status_label.configure(text="; ".join(errs), foreground="#B00020")
                     else:
@@ -2237,8 +2260,52 @@ class ProGUI:
                 except Exception:
                     pass
             threading.Thread(target=worker, daemon=True).start()
+
         tree.bind("<<TreeviewSelect>>", load_resource)
-        ttk.Button(container, text="Schliessen", command=on_close).pack(pady=(8,0), anchor="e")
+
+        def validate_current():
+            selection=tree.selection()
+            if not selection:
+                status_label.configure(text="Bitte Ressource waehlen", foreground="#B00020")
+                return
+            item_id=selection[0]
+            uri=tree.item(item_id, "values")[1]
+            cache=self._resource_cache.get(uri)
+            if not cache or not cache.get("content"):
+                status_label.configure(text="Bitte Ressource zuerst laden, dann validieren.", foreground="#C27C00")
+                load_resource()
+                return
+            status, message = self._validate_resource_content(cache.get("content"), cache.get("mime"))
+            color = "#0A7D00" if status=="OK" else ("#C27C00" if status=="WARN" else "#B00020")
+            status_label.configure(text=f"Validierung ({status}): {message}", foreground=color)
+
+        btn_row=ttk.Frame(container)
+        btn_row.pack(fill="x", pady=(8,0))
+        ttk.Button(btn_row, text="Validieren", command=validate_current).pack(side="left")
+        ttk.Button(btn_row, text="Schliessen", command=on_close).pack(side="right")
+
+    def _validate_resource_content(self, content, mime_type):
+        mime = (mime_type or "").lower()
+        try:
+            if "json" in mime:
+                json.loads(content)
+                return "OK", "JSON ist valide."
+            if "yaml" in mime or mime.endswith("+yml") or mime.endswith("+yaml"):
+                try:
+                    import yaml  # type: ignore
+                except ImportError:
+                    return "WARN", "PyYAML nicht installiert."
+                yaml.safe_load(content)
+                return "OK", "YAML ist valide."
+            if "markdown" in mime or mime.endswith("md"):
+                if content.strip():
+                    return "OK", "Markdown-Inhalt vorhanden."
+                return "FAIL", "Markdown-Inhalt ist leer."
+            if content and content.strip():
+                return "OK", "Textinhalt nicht leer."
+            return "WARN", "Inhalt ist leer."
+        except Exception as exc:
+            return "FAIL", str(exc)
 
     def _collect_context_layers(self):
         info={"errors":[], "layers":[]}
