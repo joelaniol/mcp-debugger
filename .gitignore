@@ -27,3 +27,6 @@ auth_profiles.json
 # Claude Code
 .claude/
 .claudehistory
+
+# Local agent notes
+agent.md
