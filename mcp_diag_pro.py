@@ -2129,7 +2129,8 @@ class ProGUI:
                 first = contents[0]
                 if isinstance(first, dict):
                     if first.get("text") is not None:
-                        result["content"] = str(first.get("text"))
+                        value = first.get("text")
+                        result["content"] = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
                     elif first.get("bytes") is not None:
                         result["content"] = "<binary content>"
                     else:
@@ -2137,7 +2138,10 @@ class ProGUI:
                 else:
                     result["content"] = str(first)
             else:
-                result["content"] = "<keine Daten>"
+                try:
+                    result["content"] = json.dumps(obj, ensure_ascii=False, indent=2)
+                except Exception:
+                    result["content"] = "<keine Daten>"
         except Exception as exc:
             result["errors"].append(str(exc))
         finally:
