@@ -36,14 +36,12 @@ LOG_DISPLAY_CLIP = 6000               # Maximum characters rendered per log line
 LOG_STORE_CLIP = 10000              # Maximum characters kept per log line in memory/console
 
 
-TRANSLATIONS = {
-    "Deutsch": {
-        "Settings": "Einstellungen",
-        "Language": "Sprache",
-        "English": "Englisch",
-        "Deutsch": "Deutsch",
-    }
-}
+TRANSLATIONS = {"Deutsch": {}}
+
+SESSION_RESET_MARKERS = (
+    "Session object reset",
+    "Session-Objekt zurÃ¼ckgesetzt",
+)
 
 def ts():
     return time.strftime("%H:%M:%S")
@@ -66,8 +64,9 @@ class Sink:
         # Prevent memory leak: trim log if it grows too large
         if len(self.mem_log) > 10000:
             self.mem_log = self.mem_log[-5000:]
-        if "Session-Objekt zurückgesetzt" in line or "Session-Objekt zur\u00fcckgesetzt" in line:
+        if any(marker in line for marker in SESSION_RESET_MARKERS):
             self.session_resets += 1
+
         if self.gui_cb: self.gui_cb(display)
 
 
@@ -1298,6 +1297,7 @@ class ProGUI:
         self.log_filter=tk.StringVar(value="")
         self.log_warn_only=tk.BooleanVar(value=False)
         self.log_show_ids=tk.BooleanVar(value=False)
+        self._translation_bindings=[]
         self._build_menubar()
         self._build()
         if self.language.get() != "English":
@@ -1316,6 +1316,23 @@ class ProGUI:
         if len(self.mem_log) > 10000:
             self.mem_log = self.mem_log[-5000:]
         self.q.put(m)
+
+    def _register_translation(self, english, german, setter):
+        self._translation_bindings.append((english, german, setter))
+        try:
+            setter(self._(english, german))
+        except Exception:
+            pass
+
+    def _apply_translation_bindings(self):
+        for english, german, setter in self._translation_bindings:
+            try:
+                setter(self._(english, german))
+            except Exception:
+                continue
+
+    def _sink_message(self, english, german):
+        self._sink(self._(english, german))
 
     def _pump(self):
         try:
@@ -1377,7 +1394,7 @@ class ProGUI:
         limit=getattr(self, '_log_line_display_limit', LOG_DISPLAY_CLIP)
         if limit and len(line)>limit:
             omitted=len(line)-limit
-            return f"{line[:limit]}... (gekürzt, {omitted} weitere Zeichen ausgeblendet)"
+            return f"{line[:limit]}... (gekÃ¼rzt, {omitted} weitere Zeichen ausgeblendet)"
         return line
 
     def _format_log_line(self, idx, line):
@@ -1414,7 +1431,9 @@ class ProGUI:
         if any(marker in line for marker in markers):
             self._append_event_line(line)
 
-    def _(self, text):
+    def _(self, english, german=None):
+        if german:
+            TRANSLATIONS.setdefault("Deutsch", {})[english] = german
         lang = None
         try:
             lang = self.language.get() if hasattr(self, "language") else None
@@ -1423,7 +1442,11 @@ class ProGUI:
         if not lang and hasattr(self, "_state"):
             lang = self._state.get("language")
         lang = lang or "English"
-        return TRANSLATIONS.get(lang, {}).get(text, text)
+        if lang == "Deutsch":
+            if german is not None:
+                return german
+            return TRANSLATIONS.get("Deutsch", {}).get(english, english)
+        return english
 
     def _build_menubar(self):
         if tk is None:
@@ -1431,10 +1454,18 @@ class ProGUI:
         menubar = tk.Menu(self.root)
         settings_menu = tk.Menu(menubar, tearoff=0)
         language_menu = tk.Menu(settings_menu, tearoff=0)
-        for value in ("English", "Deutsch"):
-            language_menu.add_radiobutton(label=self._(value), variable=self.language, value=value, command=self._on_language_change)
-        settings_menu.add_cascade(label=self._("Language"), menu=language_menu)
-        menubar.add_cascade(label=self._("Settings"), menu=settings_menu)
+        for value, label_en, label_de in (
+            ("English", "English", "Englisch"),
+            ("Deutsch", "German", "Deutsch"),
+        ):
+            language_menu.add_radiobutton(
+                label=self._(label_en, label_de),
+                variable=self.language,
+                value=value,
+                command=self._on_language_change,
+            )
+        settings_menu.add_cascade(label=self._("Language", "Sprache"), menu=language_menu)
+        menubar.add_cascade(label=self._("Settings", "Einstellungen"), menu=settings_menu)
         try:
             self.root.config(menu=menubar)
             self._menubar = menubar
@@ -1447,9 +1478,13 @@ class ProGUI:
             self._state["language"] = selected
             self._save_state()
             self._build_menubar()
+            self._apply_translation_bindings()
+            self._apply_auth(silent=True)
 
     def _refresh_language(self):
         self._build_menubar()
+        self._apply_translation_bindings()
+        self._apply_auth(silent=True)
 
     def _build(self):
         p={"padx":6,"pady":4}
@@ -1458,52 +1493,100 @@ class ProGUI:
             top.grid_columnconfigure(col, weight=0)
         for col in (1,2,3):
             top.grid_columnconfigure(col, weight=1)
-        ttk.Label(top, text="MCP URL:").grid(row=0, column=0, sticky="w")
+        label_url = ttk.Label(top, text=self._("MCP URL:", "MCP-URL:"))
+        label_url.grid(row=0, column=0, sticky="w")
+        self._register_translation("MCP URL:", "MCP-URL:", lambda value, w=label_url: w.configure(text=value))
         ttk.Entry(top, textvariable=self.url, width=50).grid(row=0, column=1, columnspan=2, sticky="we")
 
-        ttk.Label(top, text="TLS Mode:").grid(row=0, column=3, sticky="e")
+        label_tls = ttk.Label(top, text=self._("TLS mode:", "TLS-Modus:"))
+        label_tls.grid(row=0, column=3, sticky="e")
+        self._register_translation("TLS mode:", "TLS-Modus:", lambda value, w=label_tls: w.configure(text=value))
         tls=ttk.Combobox(top, textvariable=self.tls_mode, state="readonly",
                          values=["System Trust","Insecure (not recommended)","Embedded CA (./certs/ca.cert.pem)","Pick file..."], width=28)
         tls.grid(row=0, column=4, sticky="we")
 
-        ttk.Label(top, text="Timeout (s):").grid(row=0, column=5, sticky="e")
+        label_timeout = ttk.Label(top, text=self._("Timeout (s):", "Timeout (s):"))
+        label_timeout.grid(row=0, column=5, sticky="e")
+        self._register_translation("Timeout (s):", "Timeout (s):", lambda value, w=label_timeout: w.configure(text=value))
         ttk.Entry(top, textvariable=self.timeout, width=6).grid(row=0, column=6, sticky="w")
 
-        ttk.Label(top, text="Overall timeout (s):").grid(row=0, column=7, sticky="e")
+        label_overall_timeout = ttk.Label(top, text=self._("Overall timeout (s):", "Gesamt-Timeout (s):"))
+        label_overall_timeout.grid(row=0, column=7, sticky="e")
+        self._register_translation("Overall timeout (s):", "Gesamt-Timeout (s):", lambda value, w=label_overall_timeout: w.configure(text=value))
         ttk.Entry(top, textvariable=self.overall_timeout, width=6).grid(row=0, column=8, sticky="w")
 
-        ttk.Label(top, text="CA-Bundle:").grid(row=1, column=0, sticky="w")
+        label_ca = ttk.Label(top, text=self._("CA-Bundle:", "CA-Bundle:"))
+        label_ca.grid(row=1, column=0, sticky="w")
+        self._register_translation("CA-Bundle:", "CA-Bundle:", lambda value, w=label_ca: w.configure(text=value))
         ttk.Entry(top, textvariable=self.ca, width=50).grid(row=1, column=1, columnspan=2, sticky="we")
         ttk.Button(top, text="...", width=3, command=self._pick_ca).grid(row=1, column=3, sticky="w")
-        ttk.Button(top, text="Generate CA+Server", command=self._gen_ca).grid(row=1, column=4, sticky="w")
-        ttk.Button(top, text="Clear console", command=self._clear).grid(row=1, column=5, sticky="w")
-        ttk.Button(top, text="Save settings", command=self._save_settings).grid(row=1, column=6, sticky="w")
+        ca_btn = ttk.Button(top, text=self._("Generate CA+Server", "CA+Server erzeugen"), command=self._gen_ca)
+        ca_btn.grid(row=1, column=4, sticky="w")
+        self._register_translation("Generate CA+Server", "CA+Server erzeugen", lambda value, w=ca_btn: w.configure(text=value))
+        clear_btn = ttk.Button(top, text=self._("Clear console", "Konsole leeren"), command=self._clear)
+        clear_btn.grid(row=1, column=5, sticky="w")
+        self._register_translation("Clear console", "Konsole leeren", lambda value, w=clear_btn: w.configure(text=value))
+        save_btn = ttk.Button(top, text=self._("Save settings", "Einstellungen speichern"), command=self._save_settings)
+        save_btn.grid(row=1, column=6, sticky="w")
+        self._register_translation("Save settings", "Einstellungen speichern", lambda value, w=save_btn: w.configure(text=value))
 
-        ttk.Label(top, text="Auth:").grid(row=2, column=0, sticky="e")
+        label_auth = ttk.Label(top, text=self._("Auth:", "Auth:"))
+        label_auth.grid(row=2, column=0, sticky="e")
+        self._register_translation("Auth:", "Auth:", lambda value, w=label_auth: w.configure(text=value))
         ttk.Label(top, textvariable=self.auth_status, width=38).grid(row=2, column=1, columnspan=3, sticky="we")
         ttk.Button(top, textvariable=self.auth_toggle_text, command=self._toggle_auth, width=14).grid(row=2, column=4, sticky="w", padx=(0,4))
-        ttk.Button(top, text="Authentifizierungsmanager...", command=self._open_token_manager).grid(row=2, column=5, sticky="w")
-        ttk.Label(top, text="Konfiguration und Token im Authentifizierungsmanager pflegen.", foreground="#555").grid(row=3, column=1, columnspan=5, sticky="w", pady=(2,0))
-        ttk.Checkbutton(top, text="Session automatisch erneuern", variable=self.auto_session, command=self._save_settings).grid(row=4, column=1, columnspan=3, sticky="w", pady=(4,0))
+        token_btn = ttk.Button(top, text=self._("Open token manager...", "Authentifizierungsmanager..."), command=self._open_token_manager)
+        token_btn.grid(row=2, column=5, sticky="w")
+        self._register_translation("Open token manager...", "Authentifizierungsmanager...", lambda value, w=token_btn: w.configure(text=value))
+        auth_hint = ttk.Label(top, text=self._("Manage configuration and tokens in the token manager.", "Konfiguration und Token im Authentifizierungsmanager pflegen."), foreground="#555")
+        auth_hint.grid(row=3, column=1, columnspan=5, sticky="w", pady=(2,0))
+        self._register_translation("Manage configuration and tokens in the token manager.", "Konfiguration und Token im Authentifizierungsmanager pflegen.", lambda value, w=auth_hint: w.configure(text=value))
+        auto_session_chk = ttk.Checkbutton(top, text=self._("Automatically renew session", "Session automatisch erneuern"), variable=self.auto_session, command=self._save_settings)
+        auto_session_chk.grid(row=4, column=1, columnspan=3, sticky="w", pady=(4,0))
+        self._register_translation("Automatically renew session", "Session automatisch erneuern", lambda value, w=auto_session_chk: w.configure(text=value))
 
         prof=ttk.Frame(self.root); prof.pack(fill="x", **p)
-        ttk.Label(prof, text="Profiles:").pack(side="left")
-        ttk.Button(prof, text="Save (per URL)", command=self._save_profile).pack(side="left")
-        ttk.Button(prof, text="Load", command=self._load_profile).pack(side="left")
-        ttk.Button(prof, text="Delete", command=self._delete_profile).pack(side="left")
-        ttk.Button(prof, text="MCP Info", command=self._show_mcp_info).pack(side="left", padx=(6,0))
-        ttk.Button(prof, text="Live-Verbindung", command=self._open_sse_monitor).pack(side="left", padx=(6,0))
-        ttk.Button(prof, text="Kontext-Navigator...", command=self._open_context_layers).pack(side="left", padx=(6,0))
-        ttk.Button(prof, text="Input-Methoden...", command=self._show_input_methods).pack(side="left", padx=(6,0))
-        ttk.Button(prof, text="Ressourcen-Browser...", command=self._open_resource_browser).pack(side="left", padx=(6,0))
-        ttk.Button(prof, text="Testlabor...", command=self._open_test_lab).pack(side="left", padx=(6,0))
-        ttk.Label(prof, text="\u26a0 Token wird lokal im Klartext gespeichert. Nur auf vertrauensw\u00fcrdigen Ger\u00e4ten.").pack(side="left")
+        profiles_label = ttk.Label(prof, text=self._("Profiles:", "Profile:"))
+        profiles_label.pack(side="left")
+        self._register_translation("Profiles:", "Profile:", lambda value, w=profiles_label: w.configure(text=value))
+        save_profile_btn = ttk.Button(prof, text=self._("Save (per URL)", "Speichern (pro URL)"), command=self._save_profile)
+        save_profile_btn.pack(side="left")
+        self._register_translation("Save (per URL)", "Speichern (pro URL)", lambda value, w=save_profile_btn: w.configure(text=value))
+        load_btn = ttk.Button(prof, text=self._("Load", "Laden"), command=self._load_profile)
+        load_btn.pack(side="left")
+        self._register_translation("Load", "Laden", lambda value, w=load_btn: w.configure(text=value))
+        delete_btn = ttk.Button(prof, text=self._("Delete", "Loeschen"), command=self._delete_profile)
+        delete_btn.pack(side="left")
+        self._register_translation("Delete", "Loeschen", lambda value, w=delete_btn: w.configure(text=value))
+        info_btn = ttk.Button(prof, text=self._("MCP info", "MCP-Info"), command=self._show_mcp_info)
+        info_btn.pack(side="left", padx=(6,0))
+        self._register_translation("MCP info", "MCP-Info", lambda value, w=info_btn: w.configure(text=value))
+        live_btn = ttk.Button(prof, text=self._("Live connection", "Live-Verbindung"), command=self._open_sse_monitor)
+        live_btn.pack(side="left", padx=(6,0))
+        self._register_translation("Live connection", "Live-Verbindung", lambda value, w=live_btn: w.configure(text=value))
+        context_btn = ttk.Button(prof, text=self._("Context navigator...", "Kontext-Navigator..."), command=self._open_context_layers)
+        context_btn.pack(side="left", padx=(6,0))
+        self._register_translation("Context navigator...", "Kontext-Navigator...", lambda value, w=context_btn: w.configure(text=value))
+        input_btn = ttk.Button(prof, text=self._("Input methods...", "Input-Methoden..."), command=self._show_input_methods)
+        input_btn.pack(side="left", padx=(6,0))
+        self._register_translation("Input methods...", "Input-Methoden...", lambda value, w=input_btn: w.configure(text=value))
+        resource_btn = ttk.Button(prof, text=self._("Resource browser...", "Ressourcen-Browser..."), command=self._open_resource_browser)
+        resource_btn.pack(side="left", padx=(6,0))
+        self._register_translation("Resource browser...", "Ressourcen-Browser...", lambda value, w=resource_btn: w.configure(text=value))
+        lab_btn = ttk.Button(prof, text=self._("Test lab...", "Testlabor..."), command=self._open_test_lab)
+        lab_btn.pack(side="left", padx=(6,0))
+        self._register_translation("Test lab...", "Testlabor...", lambda value, w=lab_btn: w.configure(text=value))
+        token_warning = ttk.Label(prof, text=self._("\u26a0 Token is stored in plain text locally. Use only on trusted devices.", "\u26a0 Token wird lokal im Klartext gespeichert. Nur auf vertrauenswuerdigen Geraeten."))
+        token_warning.pack(side="left")
+        self._register_translation("\u26a0 Token is stored in plain text locally. Use only on trusted devices.", "\u26a0 Token wird lokal im Klartext gespeichert. Nur auf vertrauenswuerdigen Geraeten.", lambda value, w=token_warning: w.configure(text=value))
 
         body=ttk.PanedWindow(self.root, orient="horizontal"); body.pack(fill="both", expand=True, **p)
         left=ttk.Frame(body); right=ttk.Frame(body)
         body.add(left, weight=1); body.add(right, weight=2)
 
-        ttk.Label(left, text="Checks & Samples").pack(anchor="w")
+        checks_label = ttk.Label(left, text=self._("Checks & samples", "Checks & Samples"))
+        checks_label.pack(anchor="w")
+        self._register_translation("Checks & samples", "Checks & Samples", lambda value, w=checks_label: w.configure(text=value))
         self.tree=ttk.Treeview(left, show="tree")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._update_tree_action_state)
@@ -1525,13 +1608,20 @@ class ProGUI:
         self.tree.insert(m, "end", iid="delete_session", text="DELETE session")
 
         btns=ttk.Frame(left); btns.pack(fill="x")
-        self.run_selected_btn = ttk.Button(btns, text="Run selected", command=self._run_selected)
+        self.run_selected_btn = ttk.Button(btns, text=self._("Run selected", "Auswahl ausfuehren"), command=self._run_selected)
         self.run_selected_btn.pack(side="left")
-        ttk.Button(btns, text="Run all", command=self._run_all).pack(side="left", padx=(6,0))
-        ttk.Button(btns, text="Reset session", command=self._reset_session).pack(side="right")
+        self._register_translation("Run selected", "Auswahl ausfuehren", lambda value, w=self.run_selected_btn: w.configure(text=value))
+        run_all_btn = ttk.Button(btns, text=self._("Run all", "Alles ausfuehren"), command=self._run_all)
+        run_all_btn.pack(side="left", padx=(6,0))
+        self._register_translation("Run all", "Alles ausfuehren", lambda value, w=run_all_btn: w.configure(text=value))
+        reset_session_btn = ttk.Button(btns, text=self._("Reset session", "Session zuruecksetzen"), command=self._reset_session)
+        reset_session_btn.pack(side="right")
+        self._register_translation("Reset session", "Session zuruecksetzen", lambda value, w=reset_session_btn: w.configure(text=value))
         self._update_tree_action_state()
 
-        ttk.Label(left, text="Overall Test Summary").pack(anchor="w")
+        summary_label = ttk.Label(left, text=self._("Overall test summary", "Gesamttest-Uebersicht"))
+        summary_label.pack(anchor="w")
+        self._register_translation("Overall test summary", "Gesamttest-Uebersicht", lambda value, w=summary_label: w.configure(text=value))
         self.summary=ttk.Treeview(left, columns=("check","level","status","detail"), show="headings", height=10)
         self.summary.heading("check", text="Check")
         self.summary.heading("level", text="Level")
@@ -1548,9 +1638,12 @@ class ProGUI:
         self.summary.bind("<Double-1>", self._on_summary_double_click)
         self.summary.bind("<Button-3>", self._on_summary_right_click)
         self._summary_menu = tk.Menu(self.summary, tearoff=0)
-        self._summary_menu.add_command(label="Request/Response anzeigen", command=self._open_selected_summary_detail)
+        self._summary_menu.add_command(label=self._("Show request/response", "Request/Response anzeigen"), command=self._open_selected_summary_detail)
+        self._register_translation("Show request/response", "Request/Response anzeigen", lambda value, menu=self._summary_menu: menu.entryconfig(0, label=value))
         sumcfg=ttk.Frame(left); sumcfg.pack(fill="x")
-        ttk.Label(sumcfg, text="Overall delay (ms):").pack(side="left")
+        overall_delay_label = ttk.Label(sumcfg, text=self._("Overall delay (ms):", "Gesamtverzoegerung (ms):"))
+        overall_delay_label.pack(side="left")
+        self._register_translation("Overall delay (ms):", "Gesamtverzoegerung (ms):", lambda value, w=overall_delay_label: w.configure(text=value))
         overall_spin_cls = getattr(ttk, "Spinbox", None)
         if overall_spin_cls is None and tk is not None:
             overall_spin_cls = tk.Spinbox
@@ -1559,12 +1652,22 @@ class ProGUI:
             self._overall_delay_spin.pack(side="left", padx=(2,8))
         ttk.Label(sumcfg, textvariable=self.summary_status, foreground="#444").pack(side="left", padx=(6,0), expand=True, fill="x")
         sumbtns=ttk.Frame(left); sumbtns.pack(fill="x")
-        ttk.Button(sumbtns, text="Run overall test", command=self._run_overall).pack(side="left")
-        ttk.Button(sumbtns, text="Run auth tests", command=self._run_auth_tests).pack(side="left")
-        ttk.Button(sumbtns, text="Save report (ZIP)", command=self._save_report).pack(side="left")
-        ttk.Button(sumbtns, text="Clear summary", command=self._clear_summary).pack(side="left")
+        overall_btn = ttk.Button(sumbtns, text=self._("Run overall test", "Gesamttest starten"), command=self._run_overall)
+        overall_btn.pack(side="left")
+        self._register_translation("Run overall test", "Gesamttest starten", lambda value, w=overall_btn: w.configure(text=value))
+        auth_btn = ttk.Button(sumbtns, text=self._("Run auth tests", "Auth-Tests starten"), command=self._run_auth_tests)
+        auth_btn.pack(side="left")
+        self._register_translation("Run auth tests", "Auth-Tests starten", lambda value, w=auth_btn: w.configure(text=value))
+        save_report_btn = ttk.Button(sumbtns, text=self._("Save report (ZIP)", "Report speichern (ZIP)"), command=self._save_report)
+        save_report_btn.pack(side="left")
+        self._register_translation("Save report (ZIP)", "Report speichern (ZIP)", lambda value, w=save_report_btn: w.configure(text=value))
+        clear_summary_btn = ttk.Button(sumbtns, text=self._("Clear summary", "Zusammenfassung loeschen"), command=self._clear_summary)
+        clear_summary_btn.pack(side="left")
+        self._register_translation("Clear summary", "Zusammenfassung loeschen", lambda value, w=clear_summary_btn: w.configure(text=value))
 
-        ttk.Label(left, text="Audit results (per tool)").pack(anchor="w")
+        audit_label = ttk.Label(left, text=self._("Audit results (per tool)", "Audit-Ergebnisse (pro Tool)"))
+        audit_label.pack(anchor="w")
+        self._register_translation("Audit results (per tool)", "Audit-Ergebnisse (pro Tool)", lambda value, w=audit_label: w.configure(text=value))
         self.audit=ttk.Treeview(left, columns=("tool","status","ms","tokens","kb","detail"), show="headings", height=12)
         self.audit.heading("tool", text="Tool")
         self.audit.heading("status", text="Status")
@@ -1588,13 +1691,19 @@ class ProGUI:
         self.audit.bind("<Motion>", self._on_audit_motion)
 
         audcfg=ttk.Frame(left); audcfg.pack(fill="x")
-        ttk.Label(audcfg, text="Per-Tool Timeout (s):").pack(side="left")
+        per_tool_label = ttk.Label(audcfg, text=self._("Per-tool timeout (s):", "Timeout pro Tool (s):"))
+        per_tool_label.pack(side="left")
+        self._register_translation("Per-tool timeout (s):", "Timeout pro Tool (s):", lambda value, w=per_tool_label: w.configure(text=value))
         self.audit_timeout=tk.StringVar(value="10")
         ttk.Entry(audcfg, textvariable=self.audit_timeout, width=5).pack(side="left")
-        ttk.Label(audcfg, text="Parallelism:").pack(side="left")
+        parallel_label = ttk.Label(audcfg, text=self._("Parallelism:", "Parallelitaet:"))
+        parallel_label.pack(side="left")
+        self._register_translation("Parallelism:", "Parallelitaet:", lambda value, w=parallel_label: w.configure(text=value))
         self.audit_parallel=tk.StringVar(value="1")
         ttk.Entry(audcfg, textvariable=self.audit_parallel, width=3).pack(side="left")
-        ttk.Label(audcfg, text="Delay (ms):").pack(side="left", padx=(8,0))
+        delay_label = ttk.Label(audcfg, text=self._("Delay (ms):", "Verzoegerung (ms):"))
+        delay_label.pack(side="left", padx=(8,0))
+        self._register_translation("Delay (ms):", "Verzoegerung (ms):", lambda value, w=delay_label: w.configure(text=value))
         audit_spin_cls = getattr(ttk, "Spinbox", None)
         if audit_spin_cls is None and tk is not None:
             audit_spin_cls = tk.Spinbox
@@ -1604,38 +1713,68 @@ class ProGUI:
         self.audit_progress=tk.StringVar(value="")
         ttk.Label(audcfg, textvariable=self.audit_progress).pack(side="right")
         audbtns=ttk.Frame(left); audbtns.pack(fill="x")
-        ttk.Button(audbtns, text="Run audit", command=self._run_audit).pack(side="left")
-        ttk.Button(audbtns, text="Stop audit", command=self._stop_audit).pack(side="left")
-        ttk.Button(audbtns, text="Clear audit", command=self._clear_audit).pack(side="left")
+        run_audit_btn = ttk.Button(audbtns, text=self._("Run audit", "Audit starten"), command=self._run_audit)
+        run_audit_btn.pack(side="left")
+        self._register_translation("Run audit", "Audit starten", lambda value, w=run_audit_btn: w.configure(text=value))
+        stop_audit_btn = ttk.Button(audbtns, text=self._("Stop audit", "Audit stoppen"), command=self._stop_audit)
+        stop_audit_btn.pack(side="left")
+        self._register_translation("Stop audit", "Audit stoppen", lambda value, w=stop_audit_btn: w.configure(text=value))
+        clear_audit_btn = ttk.Button(audbtns, text=self._("Clear audit", "Audit leeren"), command=self._clear_audit)
+        clear_audit_btn.pack(side="left")
+        self._register_translation("Clear audit", "Audit leeren", lambda value, w=clear_audit_btn: w.configure(text=value))
 
-        ttk.Label(right, text="JSON-RPC Payload (f\u00fcr POST-Sample):").pack(anchor="w")
+        payload_label = ttk.Label(right, text=self._("JSON-RPC payload (for POST sample):", "JSON-RPC Payload (fuer POST-Sample):"))
+        payload_label.pack(anchor="w")
+        self._register_translation("JSON-RPC payload (for POST sample):", "JSON-RPC Payload (fuer POST-Sample):", lambda value, w=payload_label: w.configure(text=value))
         self.payload=ScrolledText(right, height=10); self.payload.pack(fill="x")
         self._prefill_payload()
 
         rightbtns=ttk.Frame(right); rightbtns.pack(fill="x")
-        ttk.Button(rightbtns, text="Open Tree Viewer (last JSON)", command=self._open_tree).pack(side="left")
-        ttk.Button(rightbtns, text="Show cURL (last request)", command=self._show_curl).pack(side="left")
-        ttk.Button(rightbtns, text="Save last request (.http)", command=self._save_httpfile).pack(side="left")
-        ttk.Button(rightbtns, text="Request-Details", command=self._show_request_details).pack(side="left")
+        tree_btn = ttk.Button(rightbtns, text=self._("Open tree viewer (last JSON)", "Baumansicht oeffnen (letztes JSON)"), command=self._open_tree)
+        tree_btn.pack(side="left")
+        self._register_translation("Open tree viewer (last JSON)", "Baumansicht oeffnen (letztes JSON)", lambda value, w=tree_btn: w.configure(text=value))
+        curl_btn = ttk.Button(rightbtns, text=self._("Show cURL (last request)", "cURL anzeigen (letzte Anfrage)"), command=self._show_curl)
+        curl_btn.pack(side="left")
+        self._register_translation("Show cURL (last request)", "cURL anzeigen (letzte Anfrage)", lambda value, w=curl_btn: w.configure(text=value))
+        save_http_btn = ttk.Button(rightbtns, text=self._("Save last request (.http)", "Letzte Anfrage speichern (.http)"), command=self._save_httpfile)
+        save_http_btn.pack(side="left")
+        self._register_translation("Save last request (.http)", "Letzte Anfrage speichern (.http)", lambda value, w=save_http_btn: w.configure(text=value))
+        req_details_btn = ttk.Button(rightbtns, text=self._("Request details", "Request-Details"), command=self._show_request_details)
+        req_details_btn.pack(side="left")
+        self._register_translation("Request details", "Request-Details", lambda value, w=req_details_btn: w.configure(text=value))
 
-        ttk.Label(right, text="Console & Ereignisse:").pack(anchor="w")
+        console_label = ttk.Label(right, text=self._("Console & events:", "Konsole & Ereignisse:"))
+        console_label.pack(anchor="w")
+        self._register_translation("Console & events:", "Konsole & Ereignisse:", lambda value, w=console_label: w.configure(text=value))
         self.log_tabs = ttk.Notebook(right)
         self.log_tabs.pack(fill="both", expand=True)
 
         console_tab = ttk.Frame(self.log_tabs)
         events_tab = ttk.Frame(self.log_tabs)
-        self.log_tabs.add(console_tab, text="Konsole")
-        self.log_tabs.add(events_tab, text="Live-Ereignisse")
+        self.log_tabs.add(console_tab, text=self._("Console", "Konsole"))
+        self._register_translation("Console", "Konsole", lambda value, nb=self.log_tabs, tab=console_tab: nb.tab(tab, text=value))
+        self.log_tabs.add(events_tab, text=self._("Live events", "Live-Ereignisse"))
+        self._register_translation("Live events", "Live-Ereignisse", lambda value, nb=self.log_tabs, tab=events_tab: nb.tab(tab, text=value))
 
         logtools = ttk.Frame(console_tab); logtools.pack(fill="x")
-        ttk.Label(logtools, text="Filter:").pack(side="left")
+        filter_label = ttk.Label(logtools, text=self._("Filter:", "Filter:"))
+        filter_label.pack(side="left")
+        self._register_translation("Filter:", "Filter:", lambda value, w=filter_label: w.configure(text=value))
         entry = ttk.Entry(logtools, textvariable=self.log_filter, width=24)
         entry.pack(side="left", padx=(2,6))
-        ttk.Button(logtools, text="Anwenden", command=self._apply_log_filter).pack(side="left")
-        ttk.Button(logtools, text="Zur\u00fccksetzen", command=self._reset_log_filter).pack(side="left", padx=(4,0))
+        apply_btn = ttk.Button(logtools, text=self._("Apply", "Anwenden"), command=self._apply_log_filter)
+        apply_btn.pack(side="left")
+        self._register_translation("Apply", "Anwenden", lambda value, w=apply_btn: w.configure(text=value))
+        reset_btn = ttk.Button(logtools, text=self._("Reset", "Zuruecksetzen"), command=self._reset_log_filter)
+        reset_btn.pack(side="left", padx=(4,0))
+        self._register_translation("Reset", "Zuruecksetzen", lambda value, w=reset_btn: w.configure(text=value))
         entry.bind("<Return>", lambda e: self._apply_log_filter())
-        ttk.Checkbutton(logtools, text="Nur Warnungen/Fehler", variable=self.log_warn_only, command=self._apply_log_filter).pack(side="left", padx=(8,0))
-        ttk.Checkbutton(logtools, text="Zeige Laufnummer", variable=self.log_show_ids, command=self._apply_log_filter).pack(side="left", padx=(8,0))
+        warn_chk = ttk.Checkbutton(logtools, text=self._("Only warnings/errors", "Nur Warnungen/Fehler"), variable=self.log_warn_only, command=self._apply_log_filter)
+        warn_chk.pack(side="left", padx=(8,0))
+        self._register_translation("Only warnings/errors", "Nur Warnungen/Fehler", lambda value, w=warn_chk: w.configure(text=value))
+        id_chk = ttk.Checkbutton(logtools, text=self._("Show entry number", "Zeige Laufnummer"), variable=self.log_show_ids, command=self._apply_log_filter)
+        id_chk.pack(side="left", padx=(8,0))
+        self._register_translation("Show entry number", "Zeige Laufnummer", lambda value, w=id_chk: w.configure(text=value))
         self.console=ScrolledText(console_tab, height=16); self.console.pack(fill="both", expand=True)
         self.console.configure(state="disabled")
 
@@ -1643,8 +1782,9 @@ class ProGUI:
         self.events_log.pack(fill="both", expand=True)
         self.events_log.configure(state="disabled", font=("Consolas", 10))
 
-        tip = ttk.Label(self.root, text="Hinweis: Overall timeout gilt nur f\u00fcr den Gesamtcheck. Bearer nur via TLS.", foreground="#444")
+        tip = ttk.Label(self.root, text=self._("Note: overall timeout only applies to the aggregated check. Use bearer tokens over TLS only.", "Hinweis: Overall timeout gilt nur fuer den Gesamtcheck. Bearer nur via TLS."), foreground="#444")
         tip.pack(fill="x", **p)
+        self._register_translation("Note: overall timeout only applies to the aggregated check. Use bearer tokens over TLS only.", "Hinweis: Overall timeout gilt nur fuer den Gesamtcheck. Bearer nur via TLS.", lambda value, w=tip: w.configure(text=value))
 
     def _center_window(self, window, min_w=600, min_h=480):
         try:
@@ -1698,7 +1838,7 @@ class ProGUI:
         self.events_log.delete("1.0","end")
         self.events_log.configure(state="disabled")
         self._refresh_console()
-    def _reset_session(self): self.client=None; self._sink("Session-Objekt zur\u00fcckgesetzt.")
+    def _reset_session(self): self.client=None; self._sink(self._("Session object reset.", "Session-Objekt zur\u00fcckgesetzt."))
 
     def _pick_ca(self):
         p=filedialog.askopenfilename(title="CA-Bundle w\u00e4hlen", filetypes=[("Zertifikate","*.pem *.crt *.cer *.ca-bundle"),("Alle Dateien","*.*")])
@@ -1725,7 +1865,7 @@ class ProGUI:
             ca_path = os.path.join(out, "ca.cert.pem")
             self.ca.set(ca_path)
             self.tls_mode.set("Embedded CA (./certs/ca.cert.pem)")
-            self._sink("CA + Server-Zertifikat unter ./certs erzeugt.")
+            self._sink_message("CA + server certificate generated under ./certs.", "CA + Server-Zertifikat unter ./certs erzeugt.")
         except Exception as e:
             self._sink(f"Zertifikatsfehler: {e}")
 
@@ -1779,9 +1919,9 @@ class ProGUI:
         connection_changed=any(previous.get(k)!=updates.get(k) for k in critical_keys)
         if connection_changed:
             self.client=None
-            self._sink("Settings saved. Connection parameters changed; session will be recreated.")
+            self._sink_message("Settings saved. Connection parameters changed; session will be recreated.", "Einstellungen gespeichert. Verbindungsparameter geaendert; Session wird neu erstellt.")
         else:
-            self._sink("Settings saved.")
+            self._sink_message("Settings saved.", "Einstellungen gespeichert.")
 
     def _on_window_close(self):
         try:
@@ -1841,7 +1981,7 @@ class ProGUI:
 
     def _apply_auth(self, silent=False):
         state = self._current_auth_state()
-        result = state.compute()
+        result = state.compute(translator=self._)
         self.auth_enabled.set(result.effective)
         self._auth_extra = result.headers
         self._set_auth_labels(result)
@@ -1862,7 +2002,7 @@ class ProGUI:
         self.auth_toggle_text.set(result.toggle)
 
     def _update_auth_status(self):
-        self._set_auth_labels(self._current_auth_state().compute())
+        self._set_auth_labels(self._current_auth_state().compute(translator=self._))
 
     def _toggle_auth(self):
         state = self._current_auth_state()
@@ -1872,7 +2012,7 @@ class ProGUI:
             self._save_settings()
             return
         if not state.ready():
-            self._sink("Auth: Bitte zuerst im Authentifizierungsmanager konfigurieren.")
+            self._sink_message("Auth: configure in the token manager first.", "Auth: Bitte zuerst im Authentifizierungsmanager konfigurieren.")
             self._open_token_manager()
             return
         self.auth_enabled.set(True)
@@ -1994,7 +2134,7 @@ class ProGUI:
         ttk.Button(top, text="Schlie\u00dfen", command=top.destroy).pack(pady=6)
 
     def _show_mcp_info(self):
-        self._sink("MCP-Info wird geladen ...")
+        self._sink_message("Loading MCP info ...", "MCP-Info wird geladen ...")
         def worker():
             info = self._collect_mcp_info()
             self.root.after(0, lambda: self._present_mcp_info(info))
@@ -2002,7 +2142,7 @@ class ProGUI:
 
     def _show_input_methods(self):
         if tk is None:
-            self._sink("Input-Methoden-Ansicht nicht verfuegbar (Tkinter fehlt).")
+            self._sink_message("Input methods view not available (Tkinter missing).", "Input-Methoden-Ansicht nicht verfuegbar (Tkinter fehlt).")
             return
         existing = getattr(self, "_input_methods_dialog", None)
         if existing and str(existing) and existing.winfo_exists():
@@ -2012,7 +2152,7 @@ class ProGUI:
             except Exception:
                 pass
             return
-        self._sink("Input-Methoden werden gesammelt ...")
+        self._sink_message("Collecting input methods ...", "Input-Methoden werden gesammelt ...")
         def worker():
             data = self._collect_input_methods()
             self.root.after(0, lambda: self._present_input_methods(data))
@@ -2071,16 +2211,23 @@ class ProGUI:
         methods=data.get("methods") or []
         errors=data.get("errors") or []
         if tk is None:
-            self._sink("Input-Methoden: " + ("keine" if not methods else str(methods)))
+            if not methods:
+                self._sink_message("Input methods: none", "Input-Methoden: keine")
+            else:
+                value = str(methods)
+                self._sink_message(f"Input methods: {value}", f"Input-Methoden: {value}")
             return
         if not methods and errors:
+            joined = "; ".join(str(e) for e in errors)
             if messagebox:
                 try:
-                    messagebox.showwarning("Input-Methoden", "Keine Input-Methoden gefunden: " + "; ".join(errors))
+                    title = self._("Input methods", "Input-Methoden")
+                    body = self._("No input methods found: {errors}", "Keine Input-Methoden gefunden: {errors}").format(errors=joined)
+                    messagebox.showwarning(title, body)
                 except Exception:
                     pass
             else:
-                self._sink("Input-Methoden: " + "; ".join(errors))
+                self._sink_message(f"Input methods: {joined}", f"Input-Methoden: {joined}")
             return
         self._resource_cache.clear()
         top=tk.Toplevel(self.root)
@@ -2126,7 +2273,7 @@ class ProGUI:
 
     def _open_resource_browser(self):
         if tk is None:
-            self._sink("Ressourcen-Browser nicht verfuegbar (Tkinter fehlt).")
+            self._sink_message("Resource browser not available (Tkinter missing).", "Ressourcen-Browser nicht verfuegbar (Tkinter fehlt).")
             return
         existing = getattr(self, "_resources_dialog", None)
         if existing and str(existing) and existing.winfo_exists():
@@ -2136,7 +2283,7 @@ class ProGUI:
             except Exception:
                 pass
             return
-        self._sink("Ressourcen werden gesammelt ...")
+        self._sink_message("Collecting resources ...", "Ressourcen werden gesammelt ...")
         def worker():
             data = self._collect_resource_list()
             self.root.after(0, lambda: self._present_resource_browser(data))
@@ -2466,12 +2613,12 @@ class ProGUI:
         if tk is None:
             return
         if not data:
-            self._sink("Kontext-Navigator: keine Daten.")
+            self._sink(self._("Context navigator: no data available.", "Kontext-Navigator: keine Daten."))
             return
         errs = data.get("errors") or []
         if errs:
-            self._sink("Kontext-Navigator Hinweise: " + " | ".join(str(e) for e in errs))
-        dlg = ContextNavigatorDialog(self, data, title="Kontext-Navigator")
+            self._sink(self._("Context navigator notes: ", "Kontext-Navigator Hinweise: ") + " | ".join(str(e) for e in errs))
+        dlg = ContextNavigatorDialog(self, data, title=self._("Context navigator", "Kontext-Navigator"))
         self._context_layers = dlg
 
     def _create_client(self, extra_override=None, silent=False):
@@ -2483,7 +2630,7 @@ class ProGUI:
             p=os.path.join(os.path.dirname(__file__),"certs","ca.cert.pem")
             verify=p if os.path.exists(p) else True
             if not os.path.exists(p):
-                self._sink("WARN: ./certs/ca.cert.pem nicht gefunden. 'Generate CA+Server' ausf\u00fchren oder TLS Mode wechseln.")
+                self._sink_message("WARN: ./certs/ca.cert.pem missing. Run 'Generate CA+Server' or change TLS mode.", "WARN: ./certs/ca.cert.pem nicht gefunden. 'Generate CA+Server' ausfuehren oder TLS Mode wechseln.")
         elif mode=="Pick file...":
             p=self.ca.get().strip(); verify=p if p else True
         url=self.url.get().strip()
@@ -2491,7 +2638,7 @@ class ProGUI:
         except: to=30.0
         extra = extra_override if extra_override is not None else getattr(self, "_auth_extra", {})
         if extra and mode=="Insecure (not recommended)":
-            self._sink("WARN: Bearer/API-Key niemals ohne TLS senden.")
+            self._sink_message("WARN: never send bearer/API key without TLS.", "WARN: Bearer/API-Key niemals ohne TLS senden.")
         if not verify:
             try:
                 from urllib3.exceptions import InsecureRequestWarning
@@ -2512,8 +2659,9 @@ class ProGUI:
                         self.mem_log = self.mem_log[-5000:]
                     if len(self.mem_log) > 10000:
                         self.mem_log = self.mem_log[-5000:]
-                    if "Session-Objekt zurückgesetzt" in line or "Session-Objekt zur\u00fcckgesetzt" in line:
+                    if any(marker in line for marker in SESSION_RESET_MARKERS):
                         self.session_resets += 1
+
             sink = QuietSink(gui_cb=None, mem_log=[])
         else:
             sink = Sink(self._sink, self.mem_log)
@@ -2559,7 +2707,7 @@ class ProGUI:
 
         def on_cancel():
             self._overall_stop_flag = True
-            self._sink("Overall-Test wird abgebrochen...")
+            self._sink_message("Overall test cancelling...", "Overall-Test wird abgebrochen...")
 
         dlg = ProgressDialog(self.root, "Gesamttest", "Vorbereitung ...", cancelable=True, on_cancel=on_cancel, modal=False)
         self._overall_progress_dialog = dlg
@@ -2733,13 +2881,13 @@ class ProGUI:
         key = self.summary_detail_map.get(item)
         if not key:
             if messagebox:
-                messagebox.showinfo("Summary", "Keine Request/Response-Daten für diesen Eintrag.")
+                messagebox.showinfo("Summary", "Keine Request/Response-Daten fÂ³r diesen Eintrag.")
             return
         details = (self.last_report or {}).get("details") or {}
         data = details.get(key)
         if not isinstance(data, dict):
             if messagebox:
-                messagebox.showwarning("Summary", f"Keine Detaildaten für '{key}' vorhanden.")
+                messagebox.showwarning("Summary", f"Keine Detaildaten fÂ³r '{key}' vorhanden.")
             return
         summary_entry = self.summary_data_map.get(item, {})
         check_label = summary_entry.get("check") or key
@@ -2797,7 +2945,7 @@ class ProGUI:
 
     def _stop_audit(self):
         self._audit_stop=True
-        self._sink("Audit stop requested. L\u00e4uft bis zum Ende des aktuellen Requests weiter.")
+        self._sink_message("Audit stop requested. Finishing current request.", "Audit-Stop angefordert. Laeuft bis zum Ende des aktuellen Requests weiter.")
         if self._audit_running:
             self.audit_progress.set(f"Stop requested \u00b7 {self._audit_running} running")
         else:
@@ -2811,7 +2959,7 @@ class ProGUI:
             except Exception:
                 confirmed = True
         if not confirmed:
-            self._sink("Run audit abgebrochen durch Benutzer.")
+            self._sink_message("Run audit cancelled by user.", "Run audit abgebrochen durch Benutzer.")
             return
         for i in self.audit.get_children(): self.audit.delete(i)
         self._audit_row_data = {}
@@ -2820,7 +2968,7 @@ class ProGUI:
         self._audit_stop=False
         c=self._build_client(reset=False)
         if c.sid=="":
-            self._sink("Keine Session aktiv. Bitte zuerst 'POST initialize' ausf\u00fchren."); return
+            self._sink_message("No session active. Run 'POST initialize' first.", "Keine Session aktiv. Bitte zuerst 'POST initialize' ausfuehren."); return
         try: per_to=float(self.audit_timeout.get() or "10")
         except: per_to=10.0
         try: parallel=int(self.audit_parallel.get() or "1")
@@ -2945,7 +3093,7 @@ class ProGUI:
 
     def _open_token_manager(self):
         if tk is None:
-            self._sink("Authentifizierungsmanager nicht verf\u00fcgbar (Tkinter fehlt).")
+            self._sink(self._("Token manager not available (Tkinter missing).", "Authentifizierungsmanager nicht verf\u00fcgbar (Tkinter fehlt)."))
             return
         existing = getattr(self, "_token_manager", None)
         if existing and str(existing) and existing.winfo_exists():
@@ -2959,7 +3107,7 @@ class ProGUI:
 
     def _open_sse_monitor(self):
         if tk is None:
-            self._sink("SSE-Monitor nicht verf\u00fcgbar (Tkinter fehlt).")
+            self._sink(self._("SSE monitor not available (Tkinter missing).", "SSE-Monitor nicht verf\u00fcgbar (Tkinter fehlt)."))
             return
         existing = getattr(self, "_sse_monitor", None)
         if existing and str(existing) and existing.winfo_exists():
@@ -2973,7 +3121,7 @@ class ProGUI:
 
     def _open_context_layers(self):
         if tk is None:
-            self._sink("Kontext-Navigator nicht verf\u00fcgbar (Tkinter fehlt).")
+            self._sink(self._("Context navigator not available (Tkinter missing).", "Kontext-Navigator nicht verf\u00fcgbar (Tkinter fehlt)."))
             return
         existing = getattr(self, "_context_layers", None)
         if existing and str(existing) and existing.winfo_exists():
@@ -2983,7 +3131,7 @@ class ProGUI:
             except Exception:
                 pass
             return
-        self._sink("Kontext-Ebenen werden gesammelt ...")
+        self._sink(self._("Collecting context layers ...", "Kontext-Ebenen werden gesammelt ..."))
         def worker():
             data = self._collect_context_layers()
             self.root.after(0, lambda: self._show_context_layers(data))
@@ -2991,7 +3139,7 @@ class ProGUI:
 
     def _open_test_lab(self):
         if tk is None:
-            self._sink("Testlabor nicht verf\u00fcgbar (Tkinter fehlt).")
+            self._sink(self._("Test lab not available (Tkinter missing).", "Testlabor nicht verf\u00fcgbar (Tkinter fehlt)."))
             return
         existing = getattr(self, "_test_lab", None)
         if existing and str(existing) and existing.winfo_exists():
@@ -3098,7 +3246,7 @@ class ProGUI:
 
     def _export_last_json(self, payload):
         if filedialog is None:
-            self._sink("JSON export not available (Tkinter fehlt).")
+            self._sink_message("JSON export not available (Tkinter missing).", "JSON-Export nicht verfuegbar (Tkinter fehlt).")
             return
         path = filedialog.asksaveasfilename(
             initialfile="mcp_last_response.json",
@@ -3232,17 +3380,23 @@ class ProGUI:
             elif action=="prompts_get_first":
                 obj,_=c.list_prompts()
                 items=(obj.get("result") or {}).get("prompts") or []
-                if not items: self._sink("WARN: keine Prompts."); return
+                if not items:
+                    self._sink_message("WARN: no prompts.", "WARN: keine Prompts.")
+                    return
                 name=items[0].get("name"); c.call("prompts/get", {"name": name, "arguments": {}}, sse_max_seconds=10)
             elif action=="resources_read_first":
                 obj,_=c.list_resources()
                 items=(obj.get("result") or {}).get("resources") or []
-                if not items: self._sink("WARN: keine Resources."); return
+                if not items:
+                    self._sink_message("WARN: no resources.", "WARN: keine Resources.")
+                    return
                 uri=items[0].get("uri"); c.call("resources/read", {"uris": [uri]}, sse_max_seconds=10)
             elif action=="tools_call_first":
                 obj,_=c.list_tools()
                 items=(obj.get("result") or {}).get("tools") or []
-                if not items: self._sink("WARN: keine Tools."); return
+                if not items:
+                    self._sink_message("WARN: no tools.", "WARN: keine Tools.")
+                    return
                 name=items[0].get("name"); c.call("tools/call", {"name": name, "arguments": {}}, sse_max_seconds=15)
             elif action=="audit_tools":
                 self._run_audit()
@@ -3564,11 +3718,11 @@ class SummaryDetailDialog(tk.Toplevel):
 
 
 class ContextNavigatorDialog(tk.Toplevel):
-    def __init__(self, gui, data, title="Kontext-Navigator"):
+    def __init__(self, gui, data, title=None):
         super().__init__(gui.root)
         self.gui=gui
         self.data=data
-        self.title(title)
+        self.title(title or gui._("Context navigator", "Kontext-Navigator"))
         self.geometry("820x520")
         try:
             self.transient(gui.root)
@@ -3599,8 +3753,8 @@ class ContextNavigatorDialog(tk.Toplevel):
         self.detail.configure(font=("Consolas", 10), state="disabled")
         btns=ttk.Frame(right)
         btns.grid(row=1, column=0, sticky="e", pady=(8,0))
-        ttk.Button(btns, text="Export JSON...", command=self._export_json).pack(side="right")
-        ttk.Button(btns, text="Schliessen", command=self._close).pack(side="right", padx=(0,6))
+        ttk.Button(btns, text=self.gui._("Export JSON...", "JSON exportieren..."), command=self._export_json).pack(side="right")
+        ttk.Button(btns, text=self.gui._("Close", "Schliessen"), command=self._close).pack(side="right", padx=(0,6))
         self.protocol("WM_DELETE_WINDOW", self._close)
 
         self.sections=data.get("layers", [])
@@ -3608,9 +3762,11 @@ class ContextNavigatorDialog(tk.Toplevel):
 
     def _populate_tree(self):
         for idx, section in enumerate(self.sections):
-            parent=self.tree.insert("", "end", text=section.get("title", f"Ebene {idx+1}"), open=True, values=("section",idx,-1))
+            default_title = self.gui._("Level {index}", "Ebene {index}").format(index=idx+1)
+            parent=self.tree.insert("", "end", text=section.get("title", default_title), open=True, values=("section",idx,-1))
             for item_idx, item in enumerate(section.get("items", [])):
-                label=item.get("label") or f"Eintrag {item_idx+1}"
+                default_label = self.gui._("Entry {index}", "Eintrag {index}").format(index=item_idx+1)
+                label=item.get("label") or default_label
                 self.tree.insert(parent, "end", text=label, values=("item", idx, item_idx))
 
     def _on_select(self, event):
@@ -3633,12 +3789,12 @@ class ContextNavigatorDialog(tk.Toplevel):
         if isinstance(details, (dict, list)):
             self.detail.insert("end", json.dumps(details, ensure_ascii=False, indent=2))
         else:
-            self.detail.insert("end", details or "keine Angaben")
+            self.detail.insert("end", details or self.gui._("No details provided.", "keine Angaben"))
         self.detail.configure(state="disabled")
 
     def _export_json(self):
         if filedialog is None:
-            self.gui._sink("JSON export not available (Tkinter fehlt).")
+            self.gui._sink(self.gui._("JSON export not available (Tkinter missing).", "JSON-Export nicht verf\u00fcgbar (Tkinter fehlt)."))
             return
         path=filedialog.asksaveasfilename(
             initialfile="mcp_context_layers.json",
@@ -3651,9 +3807,9 @@ class ContextNavigatorDialog(tk.Toplevel):
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(self.data, fh, ensure_ascii=False, indent=2)
         except Exception as exc:
-            self.gui._sink(f"Kontext-Export fehlgeschlagen: {exc}")
+            self.gui._sink(self.gui._("Context export failed: {exc}", "Kontext-Export fehlgeschlagen: {exc}").format(exc=exc))
         else:
-            self.gui._sink(f"Kontext-Export gespeichert: {path}")
+            self.gui._sink(self.gui._("Context export saved: {path}", "Kontext-Export gespeichert: {path}").format(path=path))
 
     def _close(self):
         try:
@@ -3667,11 +3823,12 @@ class SSEMonitorDialog(tk.Toplevel):
     def __init__(self, gui):
         super().__init__(gui.root)
         self.gui = gui
-        self.title("Live-Verbindung (SSE)")
+        self._ = gui._
+        self.title(self._("Live connection (SSE)", "Live-Verbindung (SSE)"))
         self._thread = None
         self._stop_event = threading.Event()
         self._response = None
-        self.status = tk.StringVar(value="Bereit")
+        self.status = tk.StringVar(value=self._("Ready", "Bereit"))
         self.last_event = tk.StringVar(value=" - ")
         self.event_count = tk.IntVar(value=0)
         self._status_label=None
@@ -3682,12 +3839,12 @@ class SSEMonitorDialog(tk.Toplevel):
         frame.pack(fill="both", expand=True)
         info = ttk.Frame(frame)
         info.pack(fill="x")
-        ttk.Label(info, text="Status:").grid(row=0, column=0, sticky="w")
+        ttk.Label(info, text=self._("Status:", "Status:")).grid(row=0, column=0, sticky="w")
         self._status_label = ttk.Label(info, textvariable=self.status)
         self._status_label.grid(row=0, column=1, sticky="w", padx=(4,0))
-        ttk.Label(info, text="Letztes Ereignis:").grid(row=1, column=0, sticky="w")
+        ttk.Label(info, text=self._("Last event:", "Letztes Ereignis:")).grid(row=1, column=0, sticky="w")
         ttk.Label(info, textvariable=self.last_event).grid(row=1, column=1, sticky="w", padx=(4,0))
-        ttk.Label(info, text="Anzahl Events:").grid(row=2, column=0, sticky="w")
+        ttk.Label(info, text=self._("Event count:", "Anzahl Events:")).grid(row=2, column=0, sticky="w")
         ttk.Label(info, textvariable=self.event_count).grid(row=2, column=1, sticky="w", padx=(4,0))
 
         self.log = ScrolledText(frame, height=18, width=80)
@@ -3696,11 +3853,11 @@ class SSEMonitorDialog(tk.Toplevel):
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(10,0))
-        self.start_btn = ttk.Button(buttons, text="Starten", command=self._start_monitor)
+        self.start_btn = ttk.Button(buttons, text=self._("Start", "Starten"), command=self._start_monitor)
         self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(buttons, text="Stoppen", command=self._stop_monitor, state="disabled")
+        self.stop_btn = ttk.Button(buttons, text=self._("Stop", "Stoppen"), command=self._stop_monitor, state="disabled")
         self.stop_btn.pack(side="left", padx=(6,0))
-        ttk.Button(buttons, text="Schlie\u00dfen", command=self._close).pack(side="right")
+        ttk.Button(buttons, text=self._("Close", "Schlie\u00dfen"), command=self._close).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self._close)
         try:
@@ -3750,9 +3907,9 @@ class SSEMonitorDialog(tk.Toplevel):
                 diff = time.time() - self._last_event_ts
                 if diff >= 0:
                     color = "#C27C00" if diff > 5 else ""
-                    self._set_status(f"Verbunden - letztes Ereignis vor {diff:.1f}s", color)
+                    self._set_status(self._("Connected - last event {seconds:.1f}s ago", "Verbunden - letztes Ereignis vor {seconds:.1f}s").format(seconds=diff), color)
             elif self._thread and self._thread.is_alive():
-                self._set_status("Verbunden - noch keine Ereignisse", "#C27C00")
+                self._set_status(self._("Connected - no events yet", "Verbunden - noch keine Ereignisse"), "#C27C00")
         finally:
             self._heartbeat_job = self.after(1000, self._heartbeat_loop)
 
@@ -3763,7 +3920,7 @@ class SSEMonitorDialog(tk.Toplevel):
         self.event_count.set(0)
         self.last_event.set(" - ")
         self._last_event_ts=None
-        self._set_status("Verbinde ...")
+        self._set_status(self._("Connecting ...", "Verbinde ..."))
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
@@ -3775,7 +3932,7 @@ class SSEMonitorDialog(tk.Toplevel):
         if not self._thread or not self._thread.is_alive():
             return
         self._stop_event.set()
-        self._set_status("Beende ...")
+        self._set_status(self._("Stopping ...", "Beende ..."))
 
     def _close(self):
         self._stop_monitor()
@@ -3808,16 +3965,16 @@ class SSEMonitorDialog(tk.Toplevel):
             client.initialize()
             client.initialized()
             init_latency = int((time.monotonic() - start) * 1000)
-            self._post(self._set_status, f"Handshake OK ({init_latency} ms)")
+            self._post(self._set_status, self._("Handshake OK ({ms} ms)", "Handshake OK ({ms} ms)").format(ms=init_latency))
             self._last_event_ts = time.time()
             headers = client._h_get()
             resp = requests.get(client.url, headers=headers, stream=True, verify=client.verify, timeout=client.timeout)
             self._response = resp
             ct = (resp.headers.get("Content-Type") or "").lower()
             if "text/event-stream" not in ct:
-                self._post(self._set_status, f"Kein Event-Stream (HTTP {resp.status_code})", "#B00020")
+                self._post(self._set_status, self._("No event stream (HTTP {status})", "Kein Event-Stream (HTTP {status})").format(status=resp.status_code), "#B00020")
                 return
-            self._post(self._set_status, "Verbunden - lausche auf Ereignisse ...")
+            self._post(self._set_status, self._("Connected - listening for events ...", "Verbunden - lausche auf Ereignisse ..."))
             sse = SSEClient(resp)
             for ev in sse.events():
                 if self._stop_event.is_set():
@@ -3833,9 +3990,9 @@ class SSEMonitorDialog(tk.Toplevel):
                     valid = False
                 preview = preview[:300]
                 self._post(self._record_event, now, ev.event or "message", preview, valid)
-            self._post(self._set_status, "Verbindung beendet")
+            self._post(self._set_status, self._("Connection closed", "Verbindung beendet"))
         except Exception as exc:
-            self._post(self._set_status, f"Fehler: {exc}", "#B00020")
+            self._post(self._set_status, self._("Error: {exc}", "Fehler: {exc}").format(exc=exc), "#B00020")
             self._post(self._append_log, f"\u26a0 {exc}")
         finally:
             self._last_event_ts = None

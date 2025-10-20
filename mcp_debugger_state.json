@@ -11,5 +11,6 @@
   "overall_delay": "200",
   "audit_delay": "200",
   "auth_enabled": false,
-  "auto_session_renew": true
+  "auto_session_renew": true,
+  "language": "English"
 }

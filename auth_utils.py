@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Callable, Dict, Optional
+
+Translator = Optional[Callable[[str, Optional[str]], str]]
 
 
 @dataclass
@@ -53,44 +55,56 @@ class AuthState:
             return {header: token}
         return {}
 
+    def _translate(self, translator: Translator, english: str, german: Optional[str] = None) -> str:
+        if translator:
+            return translator(english, german)
+        return english if german is None else english
+
     def _masked_token(self) -> str:
         token = self._trimmed_token()
         if not token:
             return ""
-        return token if len(token) <= 4 else f"{token[:4]}…"
+        return token if len(token) <= 4 else f"{token[:4]}..."
 
-    def status_text(self) -> str:
+    def status_text(self, translator: Translator = None) -> str:
+        T = lambda en, de=None: self._translate(translator, en, de)
         mode = self._normalized_mode()
         if not self.ready():
-            return "Nicht konfiguriert"
+            return T("Not configured", "Nicht konfiguriert")
         if not self.effective():
-            return f"{mode}: deaktiviert"
-        masked = self._masked_token() or "Token fehlt"
-        return f"{mode} · {self._normalized_header()} · {masked}"
+            return T(f"{mode}: disabled", f"{mode}: deaktiviert")
+        masked = self._masked_token()
+        masked_en = masked or "Token missing"
+        masked_de = masked or "Token fehlt"
+        header = self._normalized_header()
+        return T(f"{mode} | {header} | {masked_en}", f"{mode} | {header} | {masked_de}")
 
-    def toggle_text(self) -> str:
+    def toggle_text(self, translator: Translator = None) -> str:
+        T = lambda en, de=None: self._translate(translator, en, de)
         if not self.ready():
-            return "Konfigurieren…"
-        return "Deaktivieren" if self.effective() else "Aktivieren"
+            return T("Configure...", "Konfigurieren...")
+        return T("Disable", "Deaktivieren") if self.effective() else T("Enable", "Aktivieren")
 
-    def log_message(self) -> str:
+    def log_message(self, translator: Translator = None) -> str:
+        T = lambda en, de=None: self._translate(translator, en, de)
         mode = self._normalized_mode()
         if not self.ready():
-            return "Auth nicht konfiguriert."
+            return T("Auth not configured.", "Auth nicht konfiguriert.")
         if not self.effective():
-            return f"Auth deaktiviert ({mode})."
+            return T(f"Auth disabled ({mode}).", f"Auth deaktiviert ({mode}).")
         headers = self.build_headers()
         if not headers:
-            return "Auth deaktiviert."
-        return "Auth aktiv: " + "; ".join(f"{k}: ***" for k in headers)
+            return T("Auth disabled.", "Auth deaktiviert.")
+        active = "; ".join(f"{k}: ***" for k in headers)
+        return T(f"Auth active: {active}", f"Auth aktiv: {active}")
 
-    def compute(self) -> AuthComputation:
+    def compute(self, translator: Translator = None) -> AuthComputation:
         headers = self.build_headers()
         effective = self.effective()
         ready = self.ready()
-        status = self.status_text()
-        toggle = self.toggle_text()
-        log = self.log_message()
+        status = self.status_text(translator=translator)
+        toggle = self.toggle_text(translator=translator)
+        log = self.log_message(translator=translator)
         return AuthComputation(
             headers=headers,
             effective=effective,
