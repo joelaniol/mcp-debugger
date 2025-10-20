@@ -36,6 +36,15 @@ LOG_DISPLAY_CLIP = 6000               # Maximum characters rendered per log line
 LOG_STORE_CLIP = 10000              # Maximum characters kept per log line in memory/console
 
 
+TRANSLATIONS = {
+    "Deutsch": {
+        "Settings": "Einstellungen",
+        "Language": "Sprache",
+        "English": "Englisch",
+        "Deutsch": "Deutsch",
+    }
+}
+
 def ts():
     return time.strftime("%H:%M:%S")
 
@@ -1245,6 +1254,7 @@ class ProGUI:
             "auth_header":"Authorization",
             "auth_enabled":False,
             "auto_session_renew":True,
+            "language":"English",
         }
         merged={k:self._state.get(k, v) for k,v in state_defaults.items()}
         self.url=tk.StringVar(value=merged["url"])
@@ -1253,12 +1263,15 @@ class ProGUI:
         self.overall_timeout=tk.StringVar(value=merged["overall_timeout"])
         self.overall_delay=tk.StringVar(value=merged["overall_delay"])
         self.audit_delay=tk.StringVar(value=merged["audit_delay"])
-        self.summary_status=tk.StringVar(value="Bereit")
+        self.summary_status=tk.StringVar(value="Ready")
         self.ca=tk.StringVar(value=merged["ca"])
         self.auth_mode=tk.StringVar(value=merged["auth_mode"])
         self.auth_token=tk.StringVar(value=merged["auth_token"])
         self.auth_header=tk.StringVar(value=merged["auth_header"])
         self.auto_session=tk.BooleanVar(value=bool(merged.get("auto_session_renew", True)))
+        self.language=tk.StringVar(value=merged.get("language", "English"))
+        if "language" not in self._state:
+            self._state["language"] = self.language.get()
         default_enabled = bool(merged["auth_mode"] != "None" and merged["auth_token"])
         enabled_val = self._state.get("auth_enabled", default_enabled)
         self.auth_enabled=tk.BooleanVar(value=bool(enabled_val if enabled_val is not None else default_enabled))
@@ -1285,7 +1298,10 @@ class ProGUI:
         self.log_filter=tk.StringVar(value="")
         self.log_warn_only=tk.BooleanVar(value=False)
         self.log_show_ids=tk.BooleanVar(value=False)
+        self._build_menubar()
         self._build()
+        if self.language.get() != "English":
+            self._refresh_language()
         self._apply_auth(silent=True)
         self._center_window(self.root, min_w=900, min_h=640)
         self._pump()
@@ -1397,6 +1413,43 @@ class ProGUI:
         markers=("[SSE", "notifications/", "progress", "timeline", "\u26a0")
         if any(marker in line for marker in markers):
             self._append_event_line(line)
+
+    def _(self, text):
+        lang = None
+        try:
+            lang = self.language.get() if hasattr(self, "language") else None
+        except Exception:
+            lang = None
+        if not lang and hasattr(self, "_state"):
+            lang = self._state.get("language")
+        lang = lang or "English"
+        return TRANSLATIONS.get(lang, {}).get(text, text)
+
+    def _build_menubar(self):
+        if tk is None:
+            return
+        menubar = tk.Menu(self.root)
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        language_menu = tk.Menu(settings_menu, tearoff=0)
+        for value in ("English", "Deutsch"):
+            language_menu.add_radiobutton(label=self._(value), variable=self.language, value=value, command=self._on_language_change)
+        settings_menu.add_cascade(label=self._("Language"), menu=language_menu)
+        menubar.add_cascade(label=self._("Settings"), menu=settings_menu)
+        try:
+            self.root.config(menu=menubar)
+            self._menubar = menubar
+        except Exception:
+            pass
+
+    def _on_language_change(self):
+        selected = self.language.get() or "English"
+        if self._state.get("language") != selected:
+            self._state["language"] = selected
+            self._save_state()
+            self._build_menubar()
+
+    def _refresh_language(self):
+        self._build_menubar()
 
     def _build(self):
         p={"padx":6,"pady":4}
@@ -1714,6 +1767,7 @@ class ProGUI:
             "auth_header": self.auth_header.get(),
             "auth_enabled": bool(self.auth_enabled.get()),
             "auto_session_renew": bool(self.auto_session.get()),
+            "language": self.language.get(),
         }
         self._state.update(updates)
         if self.client is not None:
@@ -4473,8 +4527,4 @@ def main():
 
 if __name__=="__main__":
     main()
-
-
-
-
 
